@@ -354,6 +354,12 @@ def game_environment(s):
     env['GOW3_PATCHES_DIR'] = s['patches_dir'] or str(DATA_DIR / 'patches')
     env['GOW3_PATCHES_CONFIG'] = str(DATA_DIR / 'patches.json')
     env['GOW3_LANGUAGE'] = s['language']
+    # Xbox in-game button prompts: the runtime pastes this glyph strip into the game's button
+    # atlas (ApplyXboxGlyphs in texture_cache.cpp).
+    if s.get('pad_style') == 'xbox':
+        strip = PORT_DIR / 'launcher' / 'assets' / 'xbox_glyph_strip.bgra'
+        if strip.is_file():
+            env['GOW3_XBOX_GLYPHS'] = str(strip)
     if str(s['player_name']).strip():
         env['GOW3_USER_NAME'] = str(s['player_name']).strip()
     if s['hdr']:

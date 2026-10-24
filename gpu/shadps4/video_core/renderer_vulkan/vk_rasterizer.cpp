@@ -2362,6 +2362,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                     image = &texture_cache.GetImage(image_id);
                 }
                 debug_native(*image);
+                texture_cache.ApplyXboxGlyphs(*image);
                 if (image->binding.is_bound) {
                     image->binding.force_general |= image_desc.is_written;
                 }
@@ -2400,6 +2401,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 image = &texture_cache.GetImage(image_id);
             }
             debug_native(*image);
+            texture_cache.ApplyXboxGlyphs(*image);
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
                 // need to force general layout on it.

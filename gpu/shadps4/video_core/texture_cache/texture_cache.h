@@ -214,6 +214,10 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
+    /// Pastes the Xbox button-glyph strip (GOW3_XBOX_GLYPHS) into MediEvil's button atlas
+    /// once a bound image is recognised as that atlas.
+    void ApplyXboxGlyphs(Image& image);
+
     /// Retrieves the sampler that matches the provided S# descriptor.
     /// extra_lod_bias: gow3, added to the S#'s bias (reduced scene rendering).
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,

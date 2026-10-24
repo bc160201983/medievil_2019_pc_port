@@ -21,7 +21,11 @@
 #include "video_core/texture_cache/aliasing.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -1266,6 +1270,153 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+}
+
+namespace {
+
+constexpr u32 GlyphAtlasSize = 1024;
+constexpr u32 GlyphStripRows = 64;
+constexpr size_t GlyphStripBytes = size_t(GlyphAtlasSize) * GlyphStripRows * 4;
+
+/// The Xbox glyph strip (1024x64 B8G8R8A8, the top rows of InventoryButtonAtlas) from
+/// GOW3_XBOX_GLYPHS; empty when the file is missing or short.
+std::vector<u8> LoadXboxGlyphStrip(const char* path) {
+    std::vector<u8> strip(GlyphStripBytes);
+    std::ifstream in{path, std::ios::binary};
+    if (!in.read(reinterpret_cast<char*>(strip.data()), ssize(strip))) {
+        LOG_WARNING(Render_Vulkan, "xbox glyphs: '{}' missing or shorter than {} bytes", path,
+                    GlyphStripBytes);
+        return {};
+    }
+    return strip;
+}
+
+/// Full mip chain from mip 0 (lower levels box-filtered), levels laid out back to back.
+std::vector<u8> BuildGlyphMipChain(std::vector<u8> mip, u32 levels) {
+    std::vector<u8> chain;
+    for (u32 level = 0, w = GlyphAtlasSize, h = GlyphAtlasSize; level < levels; level++) {
+        chain.insert(chain.end(), mip.begin(), mip.end());
+        const u32 sw = std::max(w >> 1, 1u), sh = std::max(h >> 1, 1u);
+        std::vector<u8> next(size_t(sw) * sh * 4);
+        for (u32 y = 0; y < sh; y++) {
+            for (u32 x = 0; x < sw; x++) {
+                u32 acc[4] = {};
+                u32 count = 0;
+                for (u32 dy = 0; dy < 2 && y * 2 + dy < h; dy++) {
+                    for (u32 dx = 0; dx < 2 && x * 2 + dx < w; dx++) {
+                        const u8* px = &mip[((y * 2 + dy) * w + (x * 2 + dx)) * 4];
+                        for (u32 c = 0; c < 4; c++) {
+                            acc[c] += px[c];
+                        }
+                        count++;
+                    }
+                }
+                for (u32 c = 0; c < 4; c++) {
+                    next[(y * sw + x) * 4 + c] = u8(acc[c] / count);
+                }
+            }
+        }
+        mip = std::move(next);
+        w = sw;
+        h = sh;
+    }
+    return chain;
+}
+
+} // namespace
+
+void TextureCache::ApplyXboxGlyphs(Image& image) {
+    // MediEvil console button prompts: GOW3_XBOX_GLYPHS points to a 1024x64 B8G8R8A8 strip with
+    // Xbox glyphs for the top of InventoryButtonAtlas. The pak stores the GPU-tiled texture, so
+    // the swap runs at bind time: the atlas is read back, recognised by a hash of the game's own
+    // rows below the strip, and reuploaded (all mips) with the strip pasted in.
+    static const char* path = std::getenv("GOW3_XBOX_GLYPHS");
+    if (!path || *path == '\0') {
+        return;
+    }
+    const auto& info = image.info;
+    if (info.size.width != GlyphAtlasSize || info.size.height != GlyphAtlasSize ||
+        info.num_bits != 32 || info.props.is_depth || info.resources.layers != 1 ||
+        info.resources.levels == 0 || info.resources.levels > 11 ||
+        info.pitch != GlyphAtlasSize) {
+        return;
+    }
+    // XXH3 of rows 64-1023 of the original atlas as read back.
+    static constexpr u64 AtlasBodyHash = 0x2efca73e2f9fa1d3ull;
+    static std::mutex glyph_mutex;
+    static std::unordered_set<u64> replaced;                   // per guest address
+    static std::unordered_map<u64, std::chrono::steady_clock::time_point> last_probe;
+    std::scoped_lock lock{glyph_mutex};
+    if (replaced.contains(info.guest_address)) {
+        return;
+    }
+    // The game composites the atlas after the first upload, so the hash can miss on an early
+    // bind; re-probe at most twice a second until it matches.
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto it = last_probe.find(info.guest_address); it != last_probe.end() &&
+        now - it->second < std::chrono::milliseconds(500)) {
+        return;
+    }
+    last_probe[info.guest_address] = now;
+    static const std::vector<u8> strip = LoadXboxGlyphStrip(path);
+    if (strip.empty()) {
+        return;
+    }
+    const u32 read_size = GlyphAtlasSize * GlyphAtlasSize * 4;
+    const auto download =
+        runtime.GetStagingPool().Request(read_size, MemoryType::HostCached, 16);
+    const vk::BufferImageCopy read_copy = {
+        .bufferOffset = download.offset,
+        .bufferRowLength = GlyphAtlasSize,
+        .bufferImageHeight = GlyphAtlasSize,
+        .imageSubresource{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {GlyphAtlasSize, GlyphAtlasSize, 1},
+    };
+    scheduler.EndRendering();
+    runtime.DownloadImage(&image, download.buffer, std::span{&read_copy, 1});
+    scheduler.Finish();
+    download.Invalidate();
+    const u8* atlas = static_cast<const u8*>(download.mapped);
+    if (XXH3_64bits(atlas + GlyphStripBytes, read_size - GlyphStripBytes) != AtlasBodyHash) {
+        return;
+    }
+    std::vector<u8> mip0(atlas, atlas + read_size);
+    std::memcpy(mip0.data(), strip.data(), GlyphStripBytes);
+    const std::vector<u8> chain = BuildGlyphMipChain(std::move(mip0), info.resources.levels);
+    const auto upload =
+        runtime.GetStagingPool().Request(u32(chain.size()), MemoryType::HostUncached, 16);
+    std::memcpy(upload.mapped, chain.data(), chain.size());
+    upload.Flush();
+    boost::container::small_vector<vk::BufferImageCopy, 11> upload_copies;
+    u32 offset = 0;
+    for (u32 m = 0; m < info.resources.levels; m++) {
+        const u32 w = std::max(GlyphAtlasSize >> m, 1u);
+        const u32 h = std::max(GlyphAtlasSize >> m, 1u);
+        upload_copies.push_back({
+            .bufferOffset = upload.offset + offset,
+            .bufferRowLength = w,
+            .bufferImageHeight = h,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = m,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {w, h, 1},
+        });
+        offset += w * h * 4;
+    }
+    scheduler.EndRendering();
+    runtime.UploadImage(&image, upload.buffer, upload_copies);
+    replaced.insert(info.guest_address);
+    LOG_INFO(Render_Vulkan, "xbox glyphs: replaced button atlas at {:#x}", info.guest_address);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
