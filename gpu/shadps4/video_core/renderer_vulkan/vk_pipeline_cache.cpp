@@ -637,6 +637,18 @@ bool PipelineCache::AsyncCompilation() const {
     return compiler && Gow3Settings::Get().async_shaders.load(std::memory_order_relaxed);
 }
 
+// gow3: programs whose draws run once (at level load) into targets nothing redraws. A draw
+// skipped while its pipeline compiles in the background is lost for good, so these compile
+// on the spot. UE4's particle curve injection (FParticleCurveTexture): without it the curve
+// texture keeps its red clear and GPU sprites such as the torch flames get a zero size.
+static bool MustCompileSync(u64 pgm_hash) {
+    constexpr u64 programs[] = {
+        0x113f0c20873a7659ull, // vs: curve injection
+        0x1b1e7c76d6a281d3ull, // ps: curve injection
+    };
+    return std::ranges::find(programs, pgm_hash) != std::end(programs);
+}
+
 void PipelineCache::SeedWorkerCaches() {
     if (!compiler || worker_caches_seeded) {
         return;
@@ -719,7 +731,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         return nullptr;
     }
-    if (AsyncCompilation() && !sel.regs->stage_enable.hs_en && !EmulatorSettings.IsShaderCollect()) {
+    const bool sync_stage = std::ranges::any_of(
+        sel.infos, [](const Shader::Info* info) { return info && MustCompileSync(info->pgm_hash); });
+    if (AsyncCompilation() && !sel.regs->stage_enable.hs_en && !EmulatorSettings.IsShaderCollect() &&
+        !sync_stage) {
         const auto found = graphics_pipelines.find(sel.graphics_key);
         if (found != graphics_pipelines.end()) {
             return found->second.get();
@@ -1215,7 +1230,8 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
     const bool compile_async = AsyncCompilation() && hw_stage != HwStage::Compute &&
                                !sel.regs->stage_enable.hs_en &&
-                               !EmulatorSettings.IsShaderCollect();
+                               !EmulatorSettings.IsShaderCollect() &&
+                               !MustCompileSync(params.hash);
     if (!compile_async && it_pgm != program_cache.end() && it_pgm->second->pending) {
         {
             PhaseTimer waiting{g_gow3_compile_wait_ns};
