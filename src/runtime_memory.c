@@ -692,7 +692,8 @@ static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignmen
 /* Memory pools: Expand adds direct memory to the pool, Reserve takes virtual space, Commit maps
  * free pool pages into it (possibly as several physical runs), Decommit gives them back. */
 #define POOL_CHUNKS 64
-static struct { uint64_t phys, pages; unsigned char *used; } pool_chunks[POOL_CHUNKS];
+/* first_free: no page below it is free (pool_take_locked's scans start there). */
+static struct { uint64_t phys, pages, first_free; unsigned char *used; } pool_chunks[POOL_CHUNKS];
 static ABI int32_t pool_expand(int64_t low, int64_t high, uint64_t size, uint64_t alignment, int64_t *out) {
     if (!out || !size || size%(64*1024)) return INVALID;
     int32_t r=direct_allocate(low,high,size,alignment ? alignment : 64*1024,0,out);
@@ -714,11 +715,20 @@ static ABI int32_t pool_reserve(void *address, uint64_t size, uint64_t alignment
 }
 /* Longest free run (at most want pages) in the pool; marks it used. */
 static int pool_take_locked(uint64_t want, uint64_t *phys, uint64_t *pages) {
-    for (int c=0;c<POOL_CHUNKS;++c) for (uint64_t p=0;p<pool_chunks[c].pages;) {
-        if (pool_chunks[c].used[p]) { ++p; continue; }
+    /* The first free page of the lowest chunk with one: a byte-wise scan from page 0 of the
+     * 5 GB pool cost the game's render thread over a third of its time. */
+    for (int c=0;c<POOL_CHUNKS;++c) {
+        const uint64_t total=pool_chunks[c].pages;
+        unsigned char *used=pool_chunks[c].used;
+        uint64_t p=pool_chunks[c].first_free;
+        if (p>=total) continue;
+        const unsigned char *free_page=memchr(used+p,0,total-p);
+        if (!free_page) { pool_chunks[c].first_free=total; continue; }
+        p=(uint64_t)(free_page-used);
         uint64_t n=0;
-        while (p+n<pool_chunks[c].pages && n<want && !pool_chunks[c].used[p+n]) ++n;
-        memset(pool_chunks[c].used+p,1,n);
+        while (p+n<total && n<want && !used[p+n]) ++n;
+        memset(used+p,1,n);
+        pool_chunks[c].first_free=p+n;
         *phys=pool_chunks[c].phys+p*PAGE; *pages=n;
         return 1;
     }
@@ -727,7 +737,9 @@ static int pool_take_locked(uint64_t want, uint64_t *phys, uint64_t *pages) {
 static void pool_give_locked(uint64_t phys, uint64_t size) {
     for (int c=0;c<POOL_CHUNKS;++c)
         if (pool_chunks[c].pages && phys>=pool_chunks[c].phys && phys<pool_chunks[c].phys+pool_chunks[c].pages*PAGE) {
-            memset(pool_chunks[c].used+(phys-pool_chunks[c].phys)/PAGE,0,size/PAGE);
+            const uint64_t first=(phys-pool_chunks[c].phys)/PAGE;
+            memset(pool_chunks[c].used+first,0,size/PAGE);
+            if (first<pool_chunks[c].first_free) pool_chunks[c].first_free=first;
             return;
         }
 }
