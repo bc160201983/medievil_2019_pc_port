@@ -82,13 +82,22 @@ static void read_lock(void) { if (!exclusive_depth && !shared_depth++) AcquireSR
 static void read_unlock(void) { if (!exclusive_depth && !--shared_depth) ReleaseSRWLockShared(&lock); }
 #else
 static pthread_rwlock_t lock=PTHREAD_RWLOCK_INITIALIZER;
+/* Holds last a few microseconds; sleeping in the kernel and being woken cost the GPU threads
+ * more than that (graveyard route heavy 77 -> 86 FPS), so both sides spin briefly first. */
+static void spin_lock(int (*try_lock)(pthread_rwlock_t *), int (*lock_fn)(pthread_rwlock_t *)) {
+    for (int i=0;i<1000;++i) {
+        if (!try_lock(&lock)) return;
+        __builtin_ia32_pause();
+    }
+    lock_fn(&lock);
+}
 static void write_lock(void) {
-    if (!exclusive_depth++) { pthread_rwlock_wrlock(&lock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
+    if (!exclusive_depth++) { spin_lock(pthread_rwlock_trywrlock,pthread_rwlock_wrlock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
 }
 static void write_unlock(void) {
     if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); pthread_rwlock_unlock(&lock); }
 }
-static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock); }
+static void read_lock(void) { if (!exclusive_depth) spin_lock(pthread_rwlock_tryrdlock,pthread_rwlock_rdlock); }
 static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
 #endif
 static Block blocks[LIMIT];
@@ -105,6 +114,16 @@ static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook pending[64]; static size_t pending_count;
+/* The hook queue and the pool page maps are not part of the region table: they have their own
+ * short locks, so draining hooks and taking or giving pool pages do not take the table lock
+ * exclusively (each exclusive hold also empties every thread's region cache). */
+static int hook_spin, pool_spin;
+static unsigned suppress_unmap_hooks; /* set under the table lock */
+static void spin_acquire(int *s) {
+    while (__atomic_exchange_n(s,1,__ATOMIC_ACQUIRE))
+        while (__atomic_load_n(s,__ATOMIC_RELAXED)) __builtin_ia32_pause();
+}
+static void spin_release(int *s) { __atomic_store_n(s,0,__ATOMIC_RELEASE); }
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -283,19 +302,22 @@ static void host_discard(uint64_t phys, uint64_t size) {
 #endif
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
-    if (!hook) return;
+    if (!hook || (kind==HOOK_UNMAP && suppress_unmap_hooks)) return;
+    spin_acquire(&hook_spin);
     if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
     pending[pending_count++]=(PendingHook){kind,address,size};
+    spin_release(&hook_spin);
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
 static void flush_hooks(void) {
     for (;;) {
-        write_lock();
-        if (!pending_count) { write_unlock(); return; }
+        if (!__atomic_load_n(&pending_count,__ATOMIC_ACQUIRE)) return;
+        spin_acquire(&hook_spin);
+        if (!pending_count) { spin_release(&hook_spin); return; }
         PendingHook h=pending[0];
         memmove(pending,pending+1,--pending_count*sizeof(*pending));
+        spin_release(&hook_spin);
         GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
-        write_unlock();
         if (hook) hook(h.address,h.size);
     }
 }
@@ -499,9 +521,9 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
     if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
     write_lock();
-    size_t before=pending_count;
+    ++suppress_unmap_hooks; /* already notified above */
     int32_t result=unmap_locked((uintptr_t)address,size);
-    pending_count=before; /* already notified above */
+    --suppress_unmap_hooks;
     write_unlock();
     return result;
 }
@@ -703,12 +725,13 @@ static ABI int32_t pool_expand(int64_t low, int64_t high, uint64_t size, uint64_
     if (!out || !size || size%(64*1024)) return INVALID;
     int32_t r=direct_allocate(low,high,size,alignment ? alignment : 64*1024,0,out);
     if (r) return r;
-    write_lock();
+    unsigned char *used=calloc(size/PAGE,1);
+    spin_acquire(&pool_spin);
     int slot=-1;
     for (int i=0;i<POOL_CHUNKS;++i) if (!pool_chunks[i].pages) { slot=i; break; }
-    unsigned char *used=slot>=0 ? calloc(size/PAGE,1) : NULL;
-    if (used) pool_chunks[slot].phys=(uint64_t)*out, pool_chunks[slot].pages=size/PAGE, pool_chunks[slot].used=used;
-    write_unlock();
+    if (slot>=0 && used) pool_chunks[slot].phys=(uint64_t)*out, pool_chunks[slot].pages=size/PAGE, pool_chunks[slot].used=used;
+    spin_release(&pool_spin);
+    if (slot<0) { free(used); used=NULL; }
     if (!used) return NO_MEMORY;
     printf("Runtime: memory pool expanded by %" PRIu64 " bytes at 0x%" PRIx64 "\n",size,(uint64_t)*out);
     return 0;
@@ -768,16 +791,16 @@ static ABI int32_t pool_commit(void *address, uint64_t size, int type, int prot,
      * pages are taken first, so no other commit maps them meanwhile. */
     for (uint64_t done=0; done<size;) {
         uint64_t phys, pages;
-        write_lock();
+        spin_acquire(&pool_spin);
         const int taken=pool_take_locked((size-done)/PAGE,&phys,&pages);
-        write_unlock();
+        spin_release(&pool_spin);
         if (!taken) return NO_MEMORY;
         const uintptr_t at=(uintptr_t)address+done;
         const int mapped=!host_map_unlocked(at,pages*PAGE,host_prot(prot),0,phys);
         write_lock();
         int32_t r=mapped ? record_mapped(at,pages*PAGE,prot,KIND_DIRECT,type,phys) : NO_MEMORY;
-        if (r) pool_give_locked(phys,pages*PAGE);
         write_unlock();
+        if (r) { spin_acquire(&pool_spin); pool_give_locked(phys,pages*PAGE); spin_release(&pool_spin); }
         flush_hooks();
         if (r) return r;
         done+=pages*PAGE;
@@ -807,9 +830,9 @@ static ABI int32_t pool_decommit(void *address, uint64_t size, int flags) {
         if (!r && v.kind!=KIND_RESERVED) {
             if (host_map_unlocked(a,b-a,0,1,0)) r=INVALID;
             if (v.kind==KIND_DIRECT) {
-                write_lock();
+                spin_acquire(&pool_spin);
                 pool_give_locked(v.phys+(a-v.start),b-a);
-                write_unlock();
+                spin_release(&pool_spin);
             }
         }
         flush_hooks();
