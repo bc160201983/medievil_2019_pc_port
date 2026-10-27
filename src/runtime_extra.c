@@ -170,7 +170,11 @@ static ABI int32_t thread_id(void) {
 #ifdef _WIN32
     return (int32_t)GetCurrentThreadId();
 #else
-    return (int32_t)syscall(SYS_gettid);
+    /* UE4 asks for it on every IsInRenderingThread()-style check: a system call each time took
+     * most of MediEvil's render thread. A thread's id never changes. */
+    static __thread int32_t id;
+    if (!id) id=(int32_t)syscall(SYS_gettid);
+    return id;
 #endif
 }
 static ABI int32_t thread_name(void *thread, char *name) {
