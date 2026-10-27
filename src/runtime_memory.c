@@ -886,32 +886,34 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
-/* Per-thread cache of recently found regions for the GPU's per-draw queries:
- * entries hold for as long as the table generation they were read at. */
+/* Per-thread cache of found regions for the GPU's per-draw queries, one slot per 1 MiB of
+ * address (a draw's buffers span dozens of mappings): entries hold for as long as the table
+ * generation they were read at. */
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
-static __thread CachedRegion region_cache[8];
-static __thread unsigned region_cache_next;
+enum { REGION_CACHE_SLOTS=256, REGION_CACHE_SHIFT=20 };
+static __thread CachedRegion region_cache[REGION_CACHE_SLOTS];
+static unsigned region_slot(uintptr_t address) {
+    return (unsigned)((address>>REGION_CACHE_SHIFT) ^ (address>>(REGION_CACHE_SHIFT+8))) % REGION_CACHE_SLOTS;
+}
 static const CachedRegion *cached_region(uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (generation & 1) return NULL;
-    for (unsigned i=0;i<8;++i) {
-        const CachedRegion *c=&region_cache[i];
-        if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
-    }
+    const CachedRegion *c=&region_cache[region_slot(address)];
+    if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
     return NULL;
 }
 /* Called under the read lock after a lookup of address. */
-static void cache_region(size_t i) {
+static void cache_region(size_t i, uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
+    region_cache[region_slot(address)]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
     if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
     read_lock();
-    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
+    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i,address); }
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
         if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
@@ -928,7 +930,7 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     size_t i=vma_index(address);
     int found=i<vma_count;
     if (found && vmas[i].start<=address) {
-        cache_region(i);
+        cache_region(i,address);
         *start=vmas[i].start; *end=vmas[i].end; *mapped=vmas[i].kind!=KIND_RESERVED;
     } else if (found) {
         *start=i ? vmas[i-1].end : 0; *end=vmas[i].start; *mapped=0;
