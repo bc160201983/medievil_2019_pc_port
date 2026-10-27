@@ -613,13 +613,40 @@ void runtime_ue4_request_setres(const char *text) {
     __atomic_store_n(&ue4_request_pending,1,__ATOMIC_RELEASE);
 }
 
+/* Engine frame rate above 60 (GOW3_UE4_MAXFPS, run.py): MediEvil runs the console command
+ * "t.MaxFPS 60" while it loads, and UGameEngine::GetMaxTickRate returns t.MaxFPS whenever it is above
+ * 0, so the game stays at 60 whatever its configs say. GOW3_UE4_MAXFPS_CVAR is the image offset of
+ * the pointer to the variable's game- and render-thread values (ue4_override.maxfps_slot); a value
+ * between 0 and the target (not 0 = unlimited) is raised to the target, checked once a second. */
+static void ue4_maxfps_poll(unsigned reads) {
+    static float target=-1;
+    static uintptr_t slot;
+    if (target<0) {
+        const char *fps=getenv("GOW3_UE4_MAXFPS"), *env=getenv("GOW3_UE4_MAXFPS_CVAR");
+        target=fps && *fps ? strtof(fps,NULL) : 0;
+        slot=env && *env ? (uintptr_t)strtoull(env,NULL,0) : 0;
+        if (!slot || slot+8>0x6000000) target=0;
+    }
+    unsigned char *image=runtime_image_base();
+    if (target<=0 || !image || reads%60) return;
+    float *value=*(float *const *)(image+slot);
+    if (!value) return;
+    for (int i=0;i<2;++i) {
+        if (value[i]>0 && value[i]<target) {
+            if (i==0) printf("Engine frame rate: t.MaxFPS %.0f -> %.0f\n",value[i],target);
+            value[i]=target;
+        }
+    }
+}
+
 /* Called at every pad read. The start value (GOW3_UE4_SETRES) is set at 2 s, 5 s, 10 s and 20 s
  * of pad reads, as the viewport may not be up at the first ones (PR #29); a menu choice stops the
  * repeats. The pad reads are counted in every case: the menu's switches wait for 2 s of them. */
 void runtime_ue4_setres_poll(void) {
     static int automatic_done;
-    static unsigned reads;
+    static unsigned reads, polls;
     if (reads<1200) ++reads;
+    ue4_maxfps_poll(++polls);
     if (__atomic_exchange_n(&ue4_request_pending,0,__ATOMIC_ACQ_REL)) {
         char text[sizeof(ue4_requested)];
         strcpy(text,ue4_requested);
