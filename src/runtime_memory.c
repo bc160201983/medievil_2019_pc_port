@@ -382,6 +382,15 @@ static void drop_range(uintptr_t start, uintptr_t end) {
     }
     vma_erase(i,n);
 }
+/* Table side of place, for a range the host has already mapped. */
+static int32_t record_mapped(uintptr_t address, uint64_t size, int prot, int kind, int type,
+                             uint64_t phys) {
+    drop_range(address,address+size);
+    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
+    if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
+    if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
+    return 0;
+}
 /* Places a host mapping; with MAP_FIXED it replaces what the guest had there. */
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
@@ -394,13 +403,9 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         if (!address) return NO_MEMORY;
     }
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
-    void *mapped=(void *)address;
-    drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
-    if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
-    if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
-    *inout=mapped;
-    return 0;
+    const int32_t r=record_mapped(address,size,prot,kind,type,phys);
+    if (!r) *inout=(void *)address;
+    return r;
 }
 static int block_type(uint64_t phys) {
     for (int i=0;i<LIMIT;++i)
@@ -743,16 +748,34 @@ static void pool_give_locked(uint64_t phys, uint64_t size) {
             return;
         }
 }
+/* host_map for callers not holding the lock. The Windows host map edits the shared view
+ * table, so there it still takes the lock. */
+static int host_map_unlocked(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+#ifdef _WIN32
+    write_lock();
+    const int r=host_map(address,size,prot,reserved,phys);
+    write_unlock();
+    return r;
+#else
+    return host_map(address,size,prot,reserved,phys);
+#endif
+}
 static ABI int32_t pool_commit(void *address, uint64_t size, int type, int prot, int flags) {
     (void)flags;
     if (!address || (uintptr_t)address%PAGE || !size || size%PAGE) return INVALID;
-    /* One physical run per step; GPU notifications drain between steps (bounded queue). */
+    /* One physical run per step; GPU notifications drain between steps (bounded queue).
+     * The host mapping is made without the lock: the GPU threads' lookups waited on it. The
+     * pages are taken first, so no other commit maps them meanwhile. */
     for (uint64_t done=0; done<size;) {
         uint64_t phys, pages;
         write_lock();
-        if (!pool_take_locked((size-done)/PAGE,&phys,&pages)) { write_unlock(); return NO_MEMORY; }
-        void *at=(char *)address+done;
-        int32_t r=place(&at,pages*PAGE,prot,MAP_FIXED_FLAG,PAGE,KIND_DIRECT,type,phys);
+        const int taken=pool_take_locked((size-done)/PAGE,&phys,&pages);
+        write_unlock();
+        if (!taken) return NO_MEMORY;
+        const uintptr_t at=(uintptr_t)address+done;
+        const int mapped=!host_map_unlocked(at,pages*PAGE,host_prot(prot),0,phys);
+        write_lock();
+        int32_t r=mapped ? record_mapped(at,pages*PAGE,prot,KIND_DIRECT,type,phys) : NO_MEMORY;
         if (r) pool_give_locked(phys,pages*PAGE);
         write_unlock();
         flush_hooks();
@@ -765,21 +788,30 @@ static ABI int32_t pool_decommit(void *address, uint64_t size, int flags) {
     (void)flags;
     uintptr_t start=(uintptr_t)address, end=start+size;
     if (start%PAGE || !size || size%PAGE) return INVALID;
-    /* One mapped region per step, returned to the pool and left reserved. */
+    /* One mapped region per step, returned to the pool and left reserved. The table changes
+     * under the lock; the host range is then replaced by a reservation without it (one mmap
+     * instead of munmap + mmap) and only after that are the pages given back to the pool. */
     for (uintptr_t at=start; at<end;) {
         write_lock();
         size_t i=vma_index(at);
         while (i<vma_count && vmas[i].end<=at) ++i;
         if (i>=vma_count || vmas[i].start>=end) { write_unlock(); break; }
-        uintptr_t a=vmas[i].start>at ? vmas[i].start : at, b=vmas[i].end<end ? vmas[i].end : end;
+        const Vma v=vmas[i];
+        uintptr_t a=v.start>at ? v.start : at, b=v.end<end ? v.end : end;
         int32_t r=0;
-        if (vmas[i].kind!=KIND_RESERVED) {
-            if (vmas[i].kind==KIND_DIRECT) pool_give_locked(vmas[i].phys+(a-vmas[i].start),b-a);
-            r=unmap_locked(a,b-a);
-            void *p=(void *)a;
-            if (!r) r=place(&p,b-a,0,MAP_FIXED_FLAG,PAGE,KIND_RESERVED,0,0);
+        if (v.kind!=KIND_RESERVED) {
+            queue_hook(HOOK_UNMAP,a,b-a);
+            r=record_mapped(a,b-a,0,KIND_RESERVED,0,0);
         }
         write_unlock();
+        if (!r && v.kind!=KIND_RESERVED) {
+            if (host_map_unlocked(a,b-a,0,1,0)) r=INVALID;
+            if (v.kind==KIND_DIRECT) {
+                write_lock();
+                pool_give_locked(v.phys+(a-v.start),b-a);
+                write_unlock();
+            }
+        }
         flush_hooks();
         if (r) return r;
         at=b;
