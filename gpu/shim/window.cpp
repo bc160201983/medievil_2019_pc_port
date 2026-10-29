@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -17,6 +18,15 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     // They keep working while another window has the focus (the launcher, a second screen):
     // without this a pad stayed silent until the game window was clicked (issue #25).
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // Pads plugged in after start. On Windows SDL hears of them through a message window on the
+    // thread that started the gamepad subsystem, which can be the game thread (runtime_pad.c)
+    // that never pumps messages; its own thread hears them whichever thread that was. In a
+    // container (distrobox, toolbox) udev's hotplug events do not arrive: SDL watches /dev/input.
+    SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
+    if (access("/run/.containerenv", F_OK) == 0 || access("/.dockerenv", F_OK) == 0) {
+        SDL_SetHint("SDL_JOYSTICK_DISABLE_UDEV", "1");
+        SDL_SetHint(SDL_HINT_HIDAPI_UDEV, "0");
+    }
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
@@ -115,6 +125,36 @@ void WindowSDL::UpdateTextTitle() {
     Gow3Overlay::SetTextEntry(text_active, text_prompt, text);
 }
 
+// The mouse pointer hides while the game is played with a pad and comes back when the mouse moves.
+void WindowSDL::UpdateCursor(const SDL_Event& event) {
+    bool pad = false;
+    switch (event.type) {
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        pad = true;
+        break;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        pad = event.gaxis.value > 16000 || event.gaxis.value < -16000; // past stick drift
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_WHEEL:
+        if (cursor_hidden) {
+            cursor_hidden = false;
+            SDL_ShowCursor();
+        }
+        return;
+    case SDL_EVENT_GAMEPAD_ADDED:
+        std::printf("Window: SDL gamepad added (id %u)\n", static_cast<unsigned>(event.gdevice.which));
+        return;
+    default:
+        return;
+    }
+    if (pad && !cursor_hidden) {
+        cursor_hidden = true;
+        SDL_HideCursor();
+    }
+}
+
 bool WindowSDL::PollEvents() {
     {
         std::scoped_lock lock{text_mutex};
@@ -133,6 +173,7 @@ bool WindowSDL::PollEvents() {
     }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        UpdateCursor(event);
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
             std::scoped_lock lock{text_mutex};
             if (event.type == SDL_EVENT_TEXT_INPUT) {
