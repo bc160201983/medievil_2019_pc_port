@@ -72,6 +72,16 @@ struct Values {
     /// Set by the presenter: the game's image and the window it is shown in, in pixels.
     std::atomic<int> image_width{0}, image_height{0}, window_width{0}, window_height{0};
     std::atomic<int> frames_queued{1};
+    // DLSSNR-AMD (vk_neural_render.cpp). Live; percents of the nr::Controls values.
+    std::atomic<bool> nr_enabled{true};
+    std::atomic<int> nr_intensity{100}, nr_detail{100}, nr_colour{100}, nr_highlight{200};
+    std::atomic<int> nr_local_tone{100}, nr_local_structure{100}, nr_passes{1};
+    /// Set by the renderer: the network is built and runs on the game's frames.
+    std::atomic<bool> nr_active{false};
+    // FSR frame generation (vk_frame_gen.cpp, GOW3_FRAMEGEN=1). Live.
+    std::atomic<bool> fg_enabled{true};
+    /// Set by the renderer: frame generation is available (its context was created).
+    std::atomic<bool> fg_active{false};
     // Startup: run.py turns them into patches and environment variables; "Apply and restart".
     std::atomic<int> render_resolution{0};
     std::atomic<int> engine_fps{60};

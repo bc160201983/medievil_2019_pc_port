@@ -107,6 +107,24 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.rcas = i != 0;
     } else if (key == "rcas_strength") {
         v.rcas_strength = Gow3Graphics::ParseRcasStrength(value.empty() ? -1 : i);
+    } else if (key == "fg_enabled") {
+        v.fg_enabled = i != 0;
+    } else if (key == "nr_enabled") {
+        v.nr_enabled = i != 0;
+    } else if (key == "nr_intensity") {
+        v.nr_intensity = std::clamp(i, 0, 200);
+    } else if (key == "nr_detail") {
+        v.nr_detail = std::clamp(i, 0, 200);
+    } else if (key == "nr_colour") {
+        v.nr_colour = std::clamp(i, 0, 400);
+    } else if (key == "nr_highlight") {
+        v.nr_highlight = std::clamp(i, 100, 800);
+    } else if (key == "nr_local_tone") {
+        v.nr_local_tone = std::clamp(i, 0, 200);
+    } else if (key == "nr_local_structure") {
+        v.nr_local_structure = std::clamp(i, 0, 200);
+    } else if (key == "nr_passes") {
+        v.nr_passes = std::clamp(i, 1, 3);
     } else if (key == "frames_queued") {
         v.frames_queued = Gow3Graphics::ParseFramesQueued(value.empty() ? -1 : i);
     } else if (key == "render_resolution") {
@@ -342,6 +360,13 @@ void Save() {
                  Gow3Graphics::Resolutions[std::clamp(v.render_resolution.load(), 0, int(Gow3Graphics::Resolutions.size()) - 1)].data(),
                  v.engine_fps.load(), int(v.deferred_readback.load()), int(v.stale_readback.load()),
                  int(v.restart_unconfirmed.load()));
+    std::fprintf(file,
+                 "nr_enabled=%d\nnr_intensity=%d\nnr_detail=%d\nnr_colour=%d\nnr_highlight=%d\n"
+                 "nr_local_tone=%d\nnr_local_structure=%d\nnr_passes=%d\n",
+                 int(v.nr_enabled.load()), v.nr_intensity.load(), v.nr_detail.load(), v.nr_colour.load(),
+                 v.nr_highlight.load(), v.nr_local_tone.load(), v.nr_local_structure.load(),
+                 v.nr_passes.load());
+    std::fprintf(file, "fg_enabled=%d\n", int(v.fg_enabled.load()));
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");

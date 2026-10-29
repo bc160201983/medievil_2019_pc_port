@@ -37,6 +37,14 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    /// gow3: frame generation's frame, presented before this one when `generated`.
+    vk::Image gen_image{};
+    VmaAllocation gen_allocation{};
+    bool generated{false};
+    /// gow3: the frame's HUD-less copy (frame generation interpolates it).
+    vk::Image hud_image{};
+    VmaAllocation hud_allocation{};
+    vk::ImageView hud_view{};
 
 };
 
@@ -47,6 +55,7 @@ enum SchedulerType {
 };
 
 class Rasterizer;
+class FrameGen;
 
 class Presenter {
 public:
@@ -129,6 +138,7 @@ private:
     Swapchain swapchain;
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
+    std::unique_ptr<FrameGen> frame_gen;
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;

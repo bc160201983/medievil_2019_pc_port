@@ -1,0 +1,2 @@
+# Applied with git apply: keep their LF endings (0004 has binary hunks) on Windows checkouts.
+gpu/patches/**/*.patch -text

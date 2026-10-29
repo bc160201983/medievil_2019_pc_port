@@ -9,6 +9,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_neural_render.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
@@ -48,6 +49,10 @@ public:
 
     [[nodiscard]] TemporalUpscaler& GetUpscaler() noexcept {
         return *upscaler;
+    }
+
+    [[nodiscard]] NeuralRender& GetNeuralRender() noexcept {
+        return *neural_render;
     }
 
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
@@ -335,6 +340,7 @@ private:
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // gow3: FSR (docs/upscaler.md)
+    std::unique_ptr<NeuralRender> neural_render; // gow3: DLSSNR-AMD before UE4 TAAU
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;

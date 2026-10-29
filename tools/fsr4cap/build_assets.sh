@@ -9,6 +9,8 @@
 #      ratio, recording the D3D12 frames (capture_all.sh);
 #   3. extract.py translates them, checks the replay rules and writes fsr4_411/;
 #   4. with VERIFY=1, verify.sh compares the replay with the DLL byte by byte.
+# FSR4_VERSION=4.1.2 (DLL 4.1.2, run on an RDNA 4 GPU without a device ID override) builds
+# fsr4_412/ instead: the RDNA 4 kernels (cooperative matrices) of 4.1.2.
 # Needs nix-shell (or the tools on PATH: x86_64-w64-mingw32-gcc, cmake, ninja, python3,
 # spirv-dis/spirv-as, umu-run), network for the two git repositories, and a Proton build
 # (PROTONPATH, default: newest GE-Proton in Steam's compatibilitytools.d).
@@ -52,7 +54,10 @@ cp "$upscaler" "$work/amd_fidelityfx_upscaler_dx12.dll"
 cp "$loader" "$work/amd_fidelityfx_loader_dx12.dll"
 
 bash tools/fsr4cap/capture_all.sh "$work"
-python3 tools/fsr4cap/extract.py "$dx/build/dxil-spirv" "$work" fsr4_411
+assets=fsr4_$(tr -d . <<< "${FSR4_VERSION:-4.1.1}")
+# 4.1.2 (native RDNA 4): FP8 cooperative matrices, translated natively as vkd3d-proton does on RADV.
+[[ ${FSR4_VERSION:-4.1.1} == 4.1.2 ]] && export FSR4_FULL_WMMA=${FSR4_FULL_WMMA:-1 0}
+python3 tools/fsr4cap/extract.py "$dx/build/dxil-spirv" "$work" "$assets"
 if [[ ${VERIFY:-0} == 1 ]]; then
     bash build.sh
     ninja -C out/gpu fsr4-bench >/dev/null

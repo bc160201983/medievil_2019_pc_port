@@ -2,7 +2,9 @@
 // gow3: FSR 4.1.1 replay on Vulkan (fsr411.h). The frame is the DLL's 29 dispatches: SPD auto
 // exposure, prepass, pass0_post, model passes 1..12 each followed by its _post pass (tensor border
 // clears), postpass, RCAS. The rules for group counts, the tensor size table and the constants
-// are the ones tools/fsr4cap/extract.py checks against the recorded D3D12 frames.
+// are the ones tools/fsr4cap/extract.py checks against the recorded D3D12 frames. A set whose
+// kernels tile differently (the DLL's RDNA 4 kernels of 4.1.2) has a dispatch.txt: the pixels of
+// its level each pass's group covers.
 
 #include "fsr411.h"
 
@@ -218,8 +220,12 @@ struct Upscaler::Impl {
         VkDescriptorSetLayout set_layout = VK_NULL_HANDLE;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
+        uint32_t tile[2] = {}; ///< from dispatch.txt; 0: the built-in rule
     };
     std::array<Pass, kPassCount> passes{};
+    /// _post passes: tensor rows padded to post_align, at most post_cap border columns
+    /// (dispatch.txt "post"; the RDNA 3 kernels: 1, 5).
+    uint32_t post_align = 1, post_cap = 5;
     VkSampler linear_clamp = VK_NULL_HANDLE;
 
     struct Img {
@@ -404,6 +410,8 @@ struct Upscaler::Impl {
         }
         if (linear_clamp) vkDestroySampler(device, linear_clamp, nullptr);
         profile_count = {};
+        post_align = 1;
+        post_cap = 5;
         linear_clamp = VK_NULL_HANDLE;
         for (Img* img : {&recurrent, &history, &reprojected, &mlsr_output, &exposure,
                          &exposure_identity, &spd_atomic, &spd_mip5}) {
@@ -460,8 +468,21 @@ struct Upscaler::Impl {
             error = path + ": layout or module creation failed";
             return false;
         }
+        // Cooperative matrix kernels (4.1.2 RDNA 4) are written for waves of 32.
+        bool cooperative = false;
+        for (size_t i = 5; i < words.size() && (words[i] >> 16);) {
+            cooperative |= (words[i] & 0xffffu) == 17 && words[i + 1] == 6022; // CooperativeMatrixKHR
+            i += words[i] >> 16;
+        }
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo wave32{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+        wave32.requiredSubgroupSize = 32;
         VkComputePipelineCreateInfo pci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        if (cooperative) {
+            pci.stage.pNext = &wave32;
+            pci.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+        }
         pci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         pci.stage.module = module;
         pci.stage.pName = p.refl.entry.c_str();
@@ -496,6 +517,24 @@ struct Upscaler::Impl {
         for (uint32_t i = 0; i < kPassCount; ++i) {
             if (!LoadPass(i)) {
                 return false;
+            }
+        }
+        if (std::ifstream tiles{dir + "/" + set + "/dispatch.txt"}) {
+            std::string name;
+            uint32_t tx = 0, ty = 0;
+            while (tiles >> name >> tx >> ty) {
+                if (name == "post" && tx && ty) {
+                    post_align = tx;
+                    post_cap = ty;
+                    continue;
+                }
+                const auto it = std::find(std::begin(kPasses), std::end(kPasses), name);
+                if (it == std::end(kPasses) || !tx || !ty) {
+                    error = dir + "/" + set + "/dispatch.txt: bad entry " + name;
+                    return false;
+                }
+                passes[it - std::begin(kPasses)].tile[0] = tx;
+                passes[it - std::begin(kPasses)].tile[1] = ty;
             }
         }
         if (!ReadFile(dir + "/" + set + "/initializer.bin", initializer_data) ||
@@ -724,7 +763,18 @@ struct Upscaler::Impl {
             push_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, uint32_t(writes.size()),
                              writes.data());
             uint32_t gx = 1, gy = 1;
-            if (name == "spd") {
+            if (p.tile[0]) {
+                uint32_t w = aw, h = ah;
+                if (name == "spd") {
+                    w = rw;
+                    h = rh;
+                } else if (name.starts_with("pass")) {
+                    w = aw >> kRunLevel[std::stoi(name.substr(4))];
+                    h = ah >> kRunLevel[std::stoi(name.substr(4))];
+                }
+                gx = CeilDiv(w, p.tile[0]);
+                gy = CeilDiv(h, p.tile[1]);
+            } else if (name == "spd") {
                 gx = CeilDiv(rw, 64);
                 gy = CeilDiv(rh, 64);
             } else if (name == "prepass" || name == "rcas") {
@@ -739,9 +789,10 @@ struct Upscaler::Impl {
                 const uint32_t k = name == "pass0_post" ? 0 : uint32_t(std::stoi(name.substr(4)));
                 const uint32_t level = k ? kPostLevel[k] : 1;
                 const uint32_t w = aw >> level, h = ah >> level;
-                const uint32_t tw = (tier2160 ? 3840u : 1920u) >> level;
+                const uint32_t tw =
+                    CeilDiv((tier2160 ? 3840u : 1920u) >> level, post_align) * post_align;
                 const uint32_t th = (tier2160 ? 2160u : 1080u) >> level;
-                const uint32_t kx = std::min(tw + 1 - w, 5u), ky = std::min(th + 1 - h, 1u);
+                const uint32_t kx = std::min(tw + 1 - w, post_cap), ky = std::min(th + 1 - h, 1u);
                 const uint32_t threads = (w + 1 + kx) + h + h * kx + (w + 1 + kx) * ky;
                 gx = CeilDiv(threads, p.refl.local_size[0]);
             } else {

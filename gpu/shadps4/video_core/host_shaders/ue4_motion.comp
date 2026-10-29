@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// gow3: UE4 (MediEvil) motion vectors and depth for DLSSNR-AMD (vk_neural_render). UE4's
+// velocity buffer holds moving objects only (0 = static); static pixels are reprojected from
+// depth with the View uniform buffer's ClipToPrevClip, as UE4's TemporalAA does.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D depth_tex;    // D32, reversed Z
+layout(binding = 1) uniform texture2D velocity_tex; // R16G16 unorm, UE4 EncodeVelocityToTexture
+layout(binding = 2, rg16f) uniform writeonly image2D motion_img; // uv, previous - current
+layout(binding = 3, r32f) uniform writeonly image2D depth_img;
+layout(binding = 4, rgba16f) uniform writeonly image2D color_img; // the network's colour
+layout(binding = 5) uniform texture2D scene_tex;                   // UE4's scene colour
+
+layout(push_constant) uniform Constants {
+    mat4 clip_to_prev; // UE4 row-major ClipToPrevClip, used as mul(v, M)
+    ivec2 rect_min;    // view rect in the scene targets
+    ivec2 size;        // the view
+    ivec2 extent;      // the network's frame: the view, its edge repeated beyond it
+    uint flags;        // 1: draw the motion vectors into the colour; 2: FSR 4 (motion in pixels,
+                       // depth 1 - z: FSR's 0 = near)
+};
+
+void main() {
+    const ivec2 out_p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(out_p, extent))) {
+        return;
+    }
+    const ivec2 p = min(out_p, size - 1);
+    const ivec2 src = p + rect_min;
+    const float z = texelFetch(depth_tex, src, 0).r;
+    const vec2 encoded = texelFetch(velocity_tex, src, 0).rg;
+    vec2 velocity; // clip space, current - previous, y up
+    if (encoded.x > 0.0) {
+        velocity = (encoded - 32767.0 / 65535.0) / (0.499 * 0.5);
+    } else {
+        const vec2 uv = (vec2(p) + 0.5) / vec2(size);
+        const vec2 screen = vec2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        const vec4 prev = clip_to_prev * vec4(screen, z, 1.0);
+        velocity = screen - prev.xy / prev.w;
+    }
+    // In the network frame's uv: the view's, scaled by how much of that frame it covers.
+    const vec2 motion = vec2(-0.5 * velocity.x, 0.5 * velocity.y) * vec2(size) / vec2(extent);
+    const bool fsr = (flags & 2u) != 0u;
+    imageStore(motion_img, out_p, vec4(fsr ? motion * vec2(extent) : motion, 0.0, 0.0));
+    imageStore(depth_img, out_p, vec4(fsr ? 1.0 - z : z));
+    vec4 scene = texelFetch(scene_tex, src, 0);
+    if ((flags & 1u) != 0u) {
+        const vec2 pixels = motion * vec2(extent);
+        const vec3 c = vec3(max(pixels.x, 0.0), max(-pixels.x, 0.0) + max(pixels.y, 0.0),
+                            max(-pixels.y, 0.0)) * 0.25;
+        scene.rgb = mix(scene.rgb, c, encoded.x > 0.0 ? 0.9 : 0.7);
+    }
+    imageStore(color_img, out_p, scene);
+}

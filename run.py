@@ -104,6 +104,8 @@ def main():
     env.update(graphics_options.environment(graphics))
     if not env.get('GOW3_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['GOW3_FSR411_DIR'] = str(data / 'fsr4_411')
+    if not env.get('GOW3_FSR412_DIR') and not (PORT / 'fsr4_412').is_dir() and (data / 'fsr4_412').is_dir():
+        env['GOW3_FSR412_DIR'] = str(data / 'fsr4_412')
 
     probe = Path(env['GOW3_PROBE']) if env.get('GOW3_PROBE') else find_executable(RUNTIME)
     if not probe or not probe.is_file():
@@ -181,6 +183,18 @@ def main():
                                                            ini.get('ue4_aa', 'taa')), flush=True)
         except (OSError, ValueError) as error:
             print(f'Render resolution: unchanged ({error})', flush=True)
+        # medievil.ini ue4_upscaler=fsr4: FSR 4.1.1 replaces the result of UE4's temporal upscaler
+        # (vk_neural_render; needs fsr4_411/ from tools/fsr4cap/build_assets.sh, else TAAU stays).
+        # ue4_upscaler=fsr3: FSR 3.1.5 (any GPU; FSR 4 falls back to it without INT8 dot products).
+        try:
+            ini = graphics_options.read_ini(env['GOW3_CONFIG'])
+            upscaler = ini.get('ue4_upscaler', 'taau')
+            if ini.get('ue4_upscale', 'off') != 'off' and upscaler == 'fsr4':
+                env.setdefault('GOW3_UE4_FSR4', '1')
+            elif ini.get('ue4_upscale', 'off') != 'off' and upscaler == 'fsr3':
+                env.setdefault('GOW3_UE4_FSR3', '1')
+        except (OSError, ValueError):
+            pass
     original_game = game.resolve()
     game = Path(run_script('mods.py', game, '--out', out,
                            '--mods-dir', env.get('GOW3_MODS_DIR', data / 'mods'),

@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// gow3: frame generation (vk_frame_gen) interpolates the frame without the UI; the UI of the
+// game frame goes over it: where the game frame differs from its UI-less copy, it is UI.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba8) uniform readonly image2D real_img;    // the game frame
+layout(binding = 1, rgba8) uniform readonly image2D hudless_img; // the same before the UI
+layout(binding = 2, rgba8) uniform image2D output_img;           // the interpolated frame
+
+layout(push_constant) uniform Constants {
+    ivec2 size;
+    float threshold;
+};
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, size))) {
+        return;
+    }
+    const vec4 real = imageLoad(real_img, p);
+    const vec3 diff = abs(real.rgb - imageLoad(hudless_img, p).rgb);
+    if (max(diff.r, max(diff.g, diff.b)) >= threshold) {
+        imageStore(output_img, p, real);
+    }
+}

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdio>
 #include <limits>
@@ -239,6 +240,10 @@ void Swapchain::SetSurfaceProperties() {
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
     image_count = capabilities.minImageCount + 1;
+    // gow3: frame generation presents two images per game frame (vk_frame_gen).
+    if (const char* fg = std::getenv("GOW3_FRAMEGEN"); fg && fg[0] == '1') {
+        image_count += 2;
+    }
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

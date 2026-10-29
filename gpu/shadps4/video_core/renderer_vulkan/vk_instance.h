@@ -262,6 +262,11 @@ public:
                workgroup_memory_explicit_layout_features.workgroupMemoryExplicitLayout16BitAccess;
     }
 
+    /// gow3: DLSSNR-AMD's device requirements were enabled (GOW3_NR=1 and the GPU has them).
+    bool IsNeuralRenderSupported() const {
+        return neural_render;
+    }
+
     /// Returns true if VK_NV_framebuffer_mixed_samples or
     /// VK_AMD_mixed_attachment_samples is supported
     bool IsMixedDepthSamplesSupported() const {
@@ -296,6 +301,11 @@ public:
     /// gow3: FSR 4.1.1 (INT8 model passes and VK_VALVE_shader_mixed_float_dot_product).
     bool IsFsr411Supported() const {
         return IsFsr4Int8Supported() && mixed_float_dot_product;
+    }
+
+    /// gow3: FSR 4.1.2's RDNA 4 kernels (FP16 and FP8 cooperative matrices, waves of 32) can run.
+    bool IsFsr412Supported() const {
+        return neural_render || fsr4_cooperative_matrix;
     }
 
     /// VK_KHR_shader_clock is supported.
@@ -565,6 +575,8 @@ private:
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
+    bool neural_render{};
+    bool fsr4_cooperative_matrix{};
     bool maintenance_5{};
     bool pipeline_binaries{};
     vk::PipelineBinaryKeyKHR pipeline_binary_global_key{};

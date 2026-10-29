@@ -121,6 +121,8 @@ add_host_shader(taa_sharpen.comp taa_sharpen_comp)
 add_host_shader(taa_sharpen.comp taa_sharpen_ldr_comp LDR_OUTPUT=1)
 add_host_shader(buffer_multi_copy.comp buffer_multi_copy_comp)
 add_host_shader(depth_resample.frag depth_resample_frag)
+add_host_shader(ue4_motion.comp ue4_motion_comp)
+add_host_shader(fg_hud_compose.comp fg_hud_compose_comp)
 add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
 add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
 add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
@@ -172,7 +174,8 @@ target_compile_options(gow3gpu PRIVATE -Wno-deprecated-declarations -Wno-missing
 if (NOT WIN32)
     target_link_options(gow3gpu PRIVATE -Wl,--allow-shlib-undefined)
 endif()
-target_link_libraries(gow3gpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
+target_link_libraries(gow3gpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan
+    ffx-vulkan::fsr3-vk-framegeneration-3.1.6 ffx-vulkan::fsr3-vk-backend-3.1.5)
 target_link_libraries(gow3gpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
 if (WIN32)

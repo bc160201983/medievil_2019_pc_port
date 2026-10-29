@@ -15,6 +15,15 @@ MINGW*|MSYS*)
           ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
         git submodule update --init --recursive
     fi
+    # The patches are made against LF sources: an unpatched checkout is checked out again with
+    # LF first (core.autocrlf, the Windows default, gives CRLF).
+    fsr=gpu/third_party/fsr-vulkan
+    first=(gpu/patches/fsr-vulkan/*.patch)
+    if ! git -C "$fsr" apply --reverse --check "$PWD/${first[0]}" 2>/dev/null; then
+        git -C "$fsr" config core.autocrlf false
+        git -C "$fsr" rm -rq --cached .
+        git -C "$fsr" reset -q --hard
+    fi
     for patch in gpu/patches/fsr-vulkan/*.patch; do
         if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
             git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"

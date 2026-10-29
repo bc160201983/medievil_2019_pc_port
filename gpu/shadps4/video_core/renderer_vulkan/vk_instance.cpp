@@ -481,6 +481,76 @@ bool Instance::CreateDevice() {
             }
         }
     }
+    // gow3: DLSSNR-AMD (vk_neural_render) runs a cooperative-matrix FP8 network on our device.
+    vk::PhysicalDeviceCooperativeMatrixFeaturesKHR nr_coop{.cooperativeMatrix = true};
+    vk::PhysicalDeviceShaderFloat8FeaturesEXT nr_fp8{
+        .shaderFloat8 = true, .shaderFloat8CooperativeMatrix = true};
+    if (const char* env = std::getenv("GOW3_NR"); env && env[0] == '1') {
+        const auto nr_chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+        const auto& coop = nr_chain.get<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>();
+        const auto& fp8 = nr_chain.get<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+        const auto has = [&](std::string_view name) {
+            return std::find(available_extensions.begin(), available_extensions.end(), name) !=
+                   available_extensions.end();
+        };
+        neural_render = has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) &&
+                        has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) && workgroup_memory_explicit_layout &&
+                        coop.cooperativeMatrix && fp8.shaderFloat8 &&
+                        fp8.shaderFloat8CooperativeMatrix && vk12_features.vulkanMemoryModel &&
+                        vk12_features.storageBuffer8BitAccess && vk12_features.shaderFloat16 &&
+                        vk12_features.shaderInt8 && vk13_features.subgroupSizeControl &&
+                        vk13_features.synchronization2 && vk11_features.storageBuffer16BitAccess &&
+                        vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize >= 32;
+        if (neural_render) {
+            add_extension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+            add_extension(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+            if (has(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME)) {
+                add_extension(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
+            }
+            nr_coop.pNext = &nr_fp8;
+        }
+        std::printf("GPU: DLSSNR-AMD device features %s\n",
+                    neural_render ? "on" : "unavailable");
+    }
+    // gow3: FSR 4.1.2's RDNA 4 kernels (fsr4_412): 16x16x16 FP16 x FP16 -> FP32 and FP8 x FP8
+    // cooperative matrices at subgroup scope, in waves of 32. The FP8 ones run natively
+    // (VK_EXT_shader_float8), as vkd3d-proton runs the DLL; that keeps the replay bit-exact.
+    if (const char* env = std::getenv("GOW3_UE4_FSR4"); env && env[0] == '1' && !neural_render) {
+        const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+        const auto has = [&](std::string_view name) {
+            return std::find(available_extensions.begin(), available_extensions.end(), name) !=
+                   available_extensions.end();
+        };
+        const auto& fp8 = chain.get<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
+        const bool has_ext = has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) &&
+                             has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) && fp8.shaderFloat8 &&
+                             fp8.shaderFloat8CooperativeMatrix;
+        bool f16_matrix = false;
+        if (has_ext && chain.get<vk::PhysicalDeviceCooperativeMatrixFeaturesKHR>().cooperativeMatrix) {
+            const auto [r, props] = physical_device.getCooperativeMatrixPropertiesKHR();
+            for (const auto& p : r == vk::Result::eSuccess ? props : decltype(props){}) {
+                f16_matrix |= p.MSize == 16 && p.NSize == 16 && p.KSize == 16 &&
+                              p.AType == vk::ComponentTypeKHR::eFloat16 &&
+                              p.BType == vk::ComponentTypeKHR::eFloat16 &&
+                              p.CType == vk::ComponentTypeKHR::eFloat32 &&
+                              p.ResultType == vk::ComponentTypeKHR::eFloat32 &&
+                              p.scope == vk::ScopeKHR::eSubgroup;
+            }
+        }
+        fsr4_cooperative_matrix = f16_matrix && vk12_features.vulkanMemoryModel &&
+                                  vk12_features.storageBuffer8BitAccess &&
+                                  vk12_features.shaderFloat16 && vk12_features.shaderInt8 &&
+                                  features.shaderInt16 && vk13_features.subgroupSizeControl &&
+                                  vk13_features.computeFullSubgroups &&
+                                  vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize >= 32;
+        if (fsr4_cooperative_matrix) {
+            add_extension(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+            add_extension(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+            nr_coop.pNext = &nr_fp8;
+        }
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = 1u,
@@ -540,12 +610,14 @@ bool Instance::CreateDevice() {
             .hostQueryReset = vk12_features.hostQueryReset,
             .timelineSemaphore = vk12_features.timelineSemaphore,
             .bufferDeviceAddress = vk12_features.bufferDeviceAddress,
+            .vulkanMemoryModel = neural_render || fsr4_cooperative_matrix,
             .shaderOutputLayer = vk12_features.shaderOutputLayer,
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
+            .computeFullSubgroups = vk13_features.computeFullSubgroups,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
             .shaderIntegerDotProduct = vk13_features.shaderIntegerDotProduct,
@@ -701,6 +773,13 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
     }
 
+    if (neural_render) {
+        nr_fp8.pNext = const_cast<void*>(device_chain.get().pNext);
+        device_chain.get().pNext = &nr_coop;
+    } else if (fsr4_cooperative_matrix) {
+        nr_fp8.pNext = const_cast<void*>(device_chain.get().pNext);
+        device_chain.get().pNext = &nr_coop;
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));

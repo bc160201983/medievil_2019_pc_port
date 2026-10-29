@@ -55,6 +55,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // Object motion first: it fixes the buffer addresses the motion shader variants embed.
     object_motion = std::make_unique<ObjectMotion>(instance, scheduler);
     camera_motion = std::make_unique<CameraMotion>(instance, scheduler, texture_cache, runtime);
+    neural_render = std::make_unique<NeuralRender>(instance, scheduler, texture_cache, runtime);
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
@@ -1164,6 +1165,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             draw();
         }
     });
+    // gow3: frame generation interpolates the frame before the UI (UE4's tonemapper is the
+    // first full-screen draw into a display buffer after the TAAU).
+    if (neural_render->HudlessWanted() && num_indices == 3 && num_instances == 1 &&
+        regs.color_buffers[0] && FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+        neural_render->CaptureHudless(cb_descs[0].first);
+    }
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -1352,7 +1359,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
 
+    neural_render->BeginDispatch(cs.pgm_hash);
     if (!BindResources(pipeline)) {
+        neural_render->BeginDispatch(0);
         return;
     }
 
@@ -1361,6 +1370,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     }
 
     scheduler.EndRendering();
+    if (neural_render->Capturing()) {
+        neural_render->Apply();
+    }
     mark();
     pipeline->BindResources(set_writes, push_data);
 
@@ -1374,6 +1386,10 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
     DebugState.IncDispatch();
+    if (neural_render->PostPending()) {
+        // gow3: FSR 4 overwrites the TAAU's result (vk_neural_render).
+        neural_render->AfterDispatch();
+    }
 
     ResetBindings(true);
     scheduler.KickRecording();
@@ -2090,6 +2106,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                 }
             }
             if (!desc.IsSpecial()) {
+                if (neural_render->Capturing() && ring->address != 0 &&
+                    memory->IsValidGpuMapping(ring->address, 0)) {
+                    neural_render->OnBuffer(reinterpret_cast<const void*>(ring->address),
+                                            ring->size);
+                }
                 if (ring->size == 864 && gbuffer_draw && ring->address != 0 &&
                     memory->IsValidGpuMapping(ring->address, 0)) {
                     camera_motion->OnConstants(reinterpret_cast<const float*>(ring->address));
@@ -2151,6 +2172,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         } else {
             const auto vsharp =
                 prepared ? prepared->buffer_sharps[buffer_index] : desc.GetSharp(stage);
+            if (neural_render->Capturing() && vsharp.base_address != 0 &&
+                memory->IsValidGpuMapping(vsharp.base_address, 0)) {
+                neural_render->OnBuffer(reinterpret_cast<const void*>(vsharp.base_address),
+                                        vsharp.GetSize());
+            }
             if (vsharp.GetSize() == 864 && gbuffer_draw &&
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 camera_motion->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
@@ -2493,6 +2519,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 // gow3: the display pass reads the upscaled frame (scaled presets).
                 upscaler->RedirectSampled(image_id, image_view.info, view, layout);
             }
+            neural_render->OnSampled(image_id, is_storage);
             image_infos.emplace_back(VK_NULL_HANDLE, view, layout);
             if (set_ok && binding_index < resolved.size()) {
                 resolved[binding_index] = {image_id, *image_view.image_view, image.backing,
@@ -2661,6 +2688,7 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
                                     : vk::ImageLayout::eShaderReadOnlyOptimal;
         barrier |= runtime.Transit(&image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
                                    vk::AccessFlagBits2::eShaderRead, entry.range);
+        neural_render->OnSampled(entry.id);
         image_infos.emplace_back(VK_NULL_HANDLE, entry.view, image.backing->state.layout);
     }
     (void)first_image_idx;
