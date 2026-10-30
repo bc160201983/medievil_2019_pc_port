@@ -171,6 +171,9 @@ target_compile_options(gow3gpu PRIVATE -Wno-deprecated-declarations -Wno-missing
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against medievil-runtime.
 if (NOT WIN32)
     target_link_options(gow3gpu PRIVATE -Wl,--allow-shlib-undefined)
+    # medievil-runtime links the library at start (no dlopen), so its thread_locals can use the
+    # static TLS block: no __tls_get_addr call per access (~3% of the draw recording thread).
+    target_compile_options(gow3gpu PRIVATE -ftls-model=initial-exec)
 endif()
 target_link_libraries(gow3gpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(gow3gpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum

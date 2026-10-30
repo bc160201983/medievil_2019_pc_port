@@ -194,6 +194,14 @@ def main():
             # Where this eboot keeps r.SetRes, for native output and the in-game resolution
             # switches (runtime_extra.c).
             import ue4_override
+            # MediEvil runs "t.MaxFPS 60" itself while loading, over any config: the runtime
+            # raises it to the engine frame rate.
+            maxfps = ue4_override.maxfps_slot(out / 'eboot.elf') if engine_fps > 60 else None
+            if maxfps:
+                env['GOW3_UE4_MAXFPS'] = str(engine_fps)
+                env['GOW3_UE4_MAXFPS_CVAR'] = hex(maxfps)
+            elif engine_fps > 60:
+                print('Engine frame rate: t.MaxFPS not found in this game build; it stays at 60', flush=True)
             slot = ue4_override.setres_slot(out / 'eboot.elf')
             if slot:
                 env['GOW3_UE4_SETRES_CVAR'] = hex(slot)

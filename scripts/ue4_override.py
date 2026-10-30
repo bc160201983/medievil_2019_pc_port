@@ -44,10 +44,26 @@ SETRES_CODE = re.compile(re.escape(bytes.fromhex('488b1d')) + b'(....)' + re.esc
     '837db80074044c8b75b0488b034889dfff5020488b0b25000000ff')), re.S)
 
 
+# UGameEngine::GetMaxTickRate's t.MaxFPS check: the game-/render-thread float pair of the variable.
+MAXFPS_CODE = re.compile(re.escape(bytes.fromhex('488b1d')) + b'(....)' + re.escape(bytes.fromhex('41803e0074'))
+                         + b'.\xe8....' + re.escape(bytes.fromhex('488d15')) + b'....'
+                         + re.escape(bytes.fromhex('31c93b020f95c1c5f057c9c5f82e0c8b')), re.S)
+
+
 def setres_slot(elf_path):
     """Image offset of r.SetRes's IConsoleVariable* in eboot.elf; None unless its code is found once."""
+    return code_slot(elf_path, SETRES_CODE)
+
+
+def maxfps_slot(elf_path):
+    """Image offset of the pointer to t.MaxFPS's values in eboot.elf; None unless found once."""
+    return code_slot(elf_path, MAXFPS_CODE)
+
+
+def code_slot(elf_path, code):
+    """Image offset of the RIP-relative operand of the one match of code (group 1)."""
     elf = Path(elf_path).read_bytes()
-    hits = list(SETRES_CODE.finditer(elf))
+    hits = list(code.finditer(elf))
     if len(hits) != 1:
         return None
     offset = hits[0].start()

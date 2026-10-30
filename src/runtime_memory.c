@@ -82,13 +82,22 @@ static void read_lock(void) { if (!exclusive_depth && !shared_depth++) AcquireSR
 static void read_unlock(void) { if (!exclusive_depth && !--shared_depth) ReleaseSRWLockShared(&lock); }
 #else
 static pthread_rwlock_t lock=PTHREAD_RWLOCK_INITIALIZER;
+/* Holds last a few microseconds; sleeping in the kernel and being woken cost the GPU threads
+ * more than that (graveyard route heavy 77 -> 86 FPS), so both sides spin briefly first. */
+static void spin_lock(int (*try_lock)(pthread_rwlock_t *), int (*lock_fn)(pthread_rwlock_t *)) {
+    for (int i=0;i<1000;++i) {
+        if (!try_lock(&lock)) return;
+        __builtin_ia32_pause();
+    }
+    lock_fn(&lock);
+}
 static void write_lock(void) {
-    if (!exclusive_depth++) { pthread_rwlock_wrlock(&lock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
+    if (!exclusive_depth++) { spin_lock(pthread_rwlock_trywrlock,pthread_rwlock_wrlock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
 }
 static void write_unlock(void) {
     if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); pthread_rwlock_unlock(&lock); }
 }
-static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock); }
+static void read_lock(void) { if (!exclusive_depth) spin_lock(pthread_rwlock_tryrdlock,pthread_rwlock_rdlock); }
 static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
 #endif
 static Block blocks[LIMIT];
@@ -105,6 +114,16 @@ static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook pending[64]; static size_t pending_count;
+/* The hook queue and the pool page maps are not part of the region table: they have their own
+ * short locks, so draining hooks and taking or giving pool pages do not take the table lock
+ * exclusively (each exclusive hold also empties every thread's region cache). */
+static int hook_spin, pool_spin;
+static unsigned suppress_unmap_hooks; /* set under the table lock */
+static void spin_acquire(int *s) {
+    while (__atomic_exchange_n(s,1,__ATOMIC_ACQUIRE))
+        while (__atomic_load_n(s,__ATOMIC_RELAXED)) __builtin_ia32_pause();
+}
+static void spin_release(int *s) { __atomic_store_n(s,0,__ATOMIC_RELEASE); }
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -283,19 +302,22 @@ static void host_discard(uint64_t phys, uint64_t size) {
 #endif
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
-    if (!hook) return;
+    if (!hook || (kind==HOOK_UNMAP && suppress_unmap_hooks)) return;
+    spin_acquire(&hook_spin);
     if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
     pending[pending_count++]=(PendingHook){kind,address,size};
+    spin_release(&hook_spin);
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
 static void flush_hooks(void) {
     for (;;) {
-        write_lock();
-        if (!pending_count) { write_unlock(); return; }
+        if (!__atomic_load_n(&pending_count,__ATOMIC_ACQUIRE)) return;
+        spin_acquire(&hook_spin);
+        if (!pending_count) { spin_release(&hook_spin); return; }
         PendingHook h=pending[0];
         memmove(pending,pending+1,--pending_count*sizeof(*pending));
+        spin_release(&hook_spin);
         GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
-        write_unlock();
         if (hook) hook(h.address,h.size);
     }
 }
@@ -382,6 +404,15 @@ static void drop_range(uintptr_t start, uintptr_t end) {
     }
     vma_erase(i,n);
 }
+/* Table side of place, for a range the host has already mapped. */
+static int32_t record_mapped(uintptr_t address, uint64_t size, int prot, int kind, int type,
+                             uint64_t phys) {
+    drop_range(address,address+size);
+    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
+    if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
+    if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
+    return 0;
+}
 /* Places a host mapping; with MAP_FIXED it replaces what the guest had there. */
 static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t alignment,
                      int kind, int type, uint64_t phys) {
@@ -394,13 +425,9 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         if (!address) return NO_MEMORY;
     }
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
-    void *mapped=(void *)address;
-    drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
-    if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
-    if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
-    *inout=mapped;
-    return 0;
+    const int32_t r=record_mapped(address,size,prot,kind,type,phys);
+    if (!r) *inout=(void *)address;
+    return r;
 }
 static int block_type(uint64_t phys) {
     for (int i=0;i<LIMIT;++i)
@@ -494,9 +521,9 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
     if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
     write_lock();
-    size_t before=pending_count;
+    ++suppress_unmap_hooks; /* already notified above */
     int32_t result=unmap_locked((uintptr_t)address,size);
-    pending_count=before; /* already notified above */
+    --suppress_unmap_hooks;
     write_unlock();
     return result;
 }
@@ -692,17 +719,19 @@ static ABI int32_t direct_available(int64_t low, int64_t high, uint64_t alignmen
 /* Memory pools: Expand adds direct memory to the pool, Reserve takes virtual space, Commit maps
  * free pool pages into it (possibly as several physical runs), Decommit gives them back. */
 #define POOL_CHUNKS 64
-static struct { uint64_t phys, pages; unsigned char *used; } pool_chunks[POOL_CHUNKS];
+/* first_free: no page below it is free (pool_take_locked's scans start there). */
+static struct { uint64_t phys, pages, first_free; unsigned char *used; } pool_chunks[POOL_CHUNKS];
 static ABI int32_t pool_expand(int64_t low, int64_t high, uint64_t size, uint64_t alignment, int64_t *out) {
     if (!out || !size || size%(64*1024)) return INVALID;
     int32_t r=direct_allocate(low,high,size,alignment ? alignment : 64*1024,0,out);
     if (r) return r;
-    write_lock();
+    unsigned char *used=calloc(size/PAGE,1);
+    spin_acquire(&pool_spin);
     int slot=-1;
     for (int i=0;i<POOL_CHUNKS;++i) if (!pool_chunks[i].pages) { slot=i; break; }
-    unsigned char *used=slot>=0 ? calloc(size/PAGE,1) : NULL;
-    if (used) pool_chunks[slot].phys=(uint64_t)*out, pool_chunks[slot].pages=size/PAGE, pool_chunks[slot].used=used;
-    write_unlock();
+    if (slot>=0 && used) pool_chunks[slot].phys=(uint64_t)*out, pool_chunks[slot].pages=size/PAGE, pool_chunks[slot].used=used;
+    spin_release(&pool_spin);
+    if (slot<0) { free(used); used=NULL; }
     if (!used) return NO_MEMORY;
     printf("Runtime: memory pool expanded by %" PRIu64 " bytes at 0x%" PRIx64 "\n",size,(uint64_t)*out);
     return 0;
@@ -714,11 +743,20 @@ static ABI int32_t pool_reserve(void *address, uint64_t size, uint64_t alignment
 }
 /* Longest free run (at most want pages) in the pool; marks it used. */
 static int pool_take_locked(uint64_t want, uint64_t *phys, uint64_t *pages) {
-    for (int c=0;c<POOL_CHUNKS;++c) for (uint64_t p=0;p<pool_chunks[c].pages;) {
-        if (pool_chunks[c].used[p]) { ++p; continue; }
+    /* The first free page of the lowest chunk with one: a byte-wise scan from page 0 of the
+     * 5 GB pool cost the game's render thread over a third of its time. */
+    for (int c=0;c<POOL_CHUNKS;++c) {
+        const uint64_t total=pool_chunks[c].pages;
+        unsigned char *used=pool_chunks[c].used;
+        uint64_t p=pool_chunks[c].first_free;
+        if (p>=total) continue;
+        const unsigned char *free_page=memchr(used+p,0,total-p);
+        if (!free_page) { pool_chunks[c].first_free=total; continue; }
+        p=(uint64_t)(free_page-used);
         uint64_t n=0;
-        while (p+n<pool_chunks[c].pages && n<want && !pool_chunks[c].used[p+n]) ++n;
-        memset(pool_chunks[c].used+p,1,n);
+        while (p+n<total && n<want && !used[p+n]) ++n;
+        memset(used+p,1,n);
+        pool_chunks[c].first_free=p+n;
         *phys=pool_chunks[c].phys+p*PAGE; *pages=n;
         return 1;
     }
@@ -727,22 +765,42 @@ static int pool_take_locked(uint64_t want, uint64_t *phys, uint64_t *pages) {
 static void pool_give_locked(uint64_t phys, uint64_t size) {
     for (int c=0;c<POOL_CHUNKS;++c)
         if (pool_chunks[c].pages && phys>=pool_chunks[c].phys && phys<pool_chunks[c].phys+pool_chunks[c].pages*PAGE) {
-            memset(pool_chunks[c].used+(phys-pool_chunks[c].phys)/PAGE,0,size/PAGE);
+            const uint64_t first=(phys-pool_chunks[c].phys)/PAGE;
+            memset(pool_chunks[c].used+first,0,size/PAGE);
+            if (first<pool_chunks[c].first_free) pool_chunks[c].first_free=first;
             return;
         }
+}
+/* host_map for callers not holding the lock. The Windows host map edits the shared view
+ * table, so there it still takes the lock. */
+static int host_map_unlocked(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+#ifdef _WIN32
+    write_lock();
+    const int r=host_map(address,size,prot,reserved,phys);
+    write_unlock();
+    return r;
+#else
+    return host_map(address,size,prot,reserved,phys);
+#endif
 }
 static ABI int32_t pool_commit(void *address, uint64_t size, int type, int prot, int flags) {
     (void)flags;
     if (!address || (uintptr_t)address%PAGE || !size || size%PAGE) return INVALID;
-    /* One physical run per step; GPU notifications drain between steps (bounded queue). */
+    /* One physical run per step; GPU notifications drain between steps (bounded queue).
+     * The host mapping is made without the lock: the GPU threads' lookups waited on it. The
+     * pages are taken first, so no other commit maps them meanwhile. */
     for (uint64_t done=0; done<size;) {
         uint64_t phys, pages;
+        spin_acquire(&pool_spin);
+        const int taken=pool_take_locked((size-done)/PAGE,&phys,&pages);
+        spin_release(&pool_spin);
+        if (!taken) return NO_MEMORY;
+        const uintptr_t at=(uintptr_t)address+done;
+        const int mapped=!host_map_unlocked(at,pages*PAGE,host_prot(prot),0,phys);
         write_lock();
-        if (!pool_take_locked((size-done)/PAGE,&phys,&pages)) { write_unlock(); return NO_MEMORY; }
-        void *at=(char *)address+done;
-        int32_t r=place(&at,pages*PAGE,prot,MAP_FIXED_FLAG,PAGE,KIND_DIRECT,type,phys);
-        if (r) pool_give_locked(phys,pages*PAGE);
+        int32_t r=mapped ? record_mapped(at,pages*PAGE,prot,KIND_DIRECT,type,phys) : NO_MEMORY;
         write_unlock();
+        if (r) { spin_acquire(&pool_spin); pool_give_locked(phys,pages*PAGE); spin_release(&pool_spin); }
         flush_hooks();
         if (r) return r;
         done+=pages*PAGE;
@@ -753,21 +811,30 @@ static ABI int32_t pool_decommit(void *address, uint64_t size, int flags) {
     (void)flags;
     uintptr_t start=(uintptr_t)address, end=start+size;
     if (start%PAGE || !size || size%PAGE) return INVALID;
-    /* One mapped region per step, returned to the pool and left reserved. */
+    /* One mapped region per step, returned to the pool and left reserved. The table changes
+     * under the lock; the host range is then replaced by a reservation without it (one mmap
+     * instead of munmap + mmap) and only after that are the pages given back to the pool. */
     for (uintptr_t at=start; at<end;) {
         write_lock();
         size_t i=vma_index(at);
         while (i<vma_count && vmas[i].end<=at) ++i;
         if (i>=vma_count || vmas[i].start>=end) { write_unlock(); break; }
-        uintptr_t a=vmas[i].start>at ? vmas[i].start : at, b=vmas[i].end<end ? vmas[i].end : end;
+        const Vma v=vmas[i];
+        uintptr_t a=v.start>at ? v.start : at, b=v.end<end ? v.end : end;
         int32_t r=0;
-        if (vmas[i].kind!=KIND_RESERVED) {
-            if (vmas[i].kind==KIND_DIRECT) pool_give_locked(vmas[i].phys+(a-vmas[i].start),b-a);
-            r=unmap_locked(a,b-a);
-            void *p=(void *)a;
-            if (!r) r=place(&p,b-a,0,MAP_FIXED_FLAG,PAGE,KIND_RESERVED,0,0);
+        if (v.kind!=KIND_RESERVED) {
+            queue_hook(HOOK_UNMAP,a,b-a);
+            r=record_mapped(a,b-a,0,KIND_RESERVED,0,0);
         }
         write_unlock();
+        if (!r && v.kind!=KIND_RESERVED) {
+            if (host_map_unlocked(a,b-a,0,1,0)) r=INVALID;
+            if (v.kind==KIND_DIRECT) {
+                spin_acquire(&pool_spin);
+                pool_give_locked(v.phys+(a-v.start),b-a);
+                spin_release(&pool_spin);
+            }
+        }
         flush_hooks();
         if (r) return r;
         at=b;
@@ -886,32 +953,34 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
-/* Per-thread cache of recently found regions for the GPU's per-draw queries:
- * entries hold for as long as the table generation they were read at. */
+/* Per-thread cache of found regions for the GPU's per-draw queries, one slot per 1 MiB of
+ * address (a draw's buffers span dozens of mappings): entries hold for as long as the table
+ * generation they were read at. */
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; } CachedRegion;
-static __thread CachedRegion region_cache[8];
-static __thread unsigned region_cache_next;
+enum { REGION_CACHE_SLOTS=256, REGION_CACHE_SHIFT=20 };
+static __thread CachedRegion region_cache[REGION_CACHE_SLOTS];
+static unsigned region_slot(uintptr_t address) {
+    return (unsigned)((address>>REGION_CACHE_SHIFT) ^ (address>>(REGION_CACHE_SHIFT+8))) % REGION_CACHE_SLOTS;
+}
 static const CachedRegion *cached_region(uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (generation & 1) return NULL;
-    for (unsigned i=0;i<8;++i) {
-        const CachedRegion *c=&region_cache[i];
-        if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
-    }
+    const CachedRegion *c=&region_cache[region_slot(address)];
+    if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
     return NULL;
 }
 /* Called under the read lock after a lookup of address. */
-static void cache_region(size_t i) {
+static void cache_region(size_t i, uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
+    region_cache[region_slot(address)]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind};
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
     if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
     read_lock();
-    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
+    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i,address); }
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
         if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
@@ -928,7 +997,7 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     size_t i=vma_index(address);
     int found=i<vma_count;
     if (found && vmas[i].start<=address) {
-        cache_region(i);
+        cache_region(i,address);
         *start=vmas[i].start; *end=vmas[i].end; *mapped=vmas[i].kind!=KIND_RESERVED;
     } else if (found) {
         *start=i ? vmas[i-1].end : 0; *end=vmas[i].start; *mapped=0;
