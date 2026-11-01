@@ -2,9 +2,12 @@
 
 A single-file Linux build of the port: `MediEvil-x86_64.AppImage`. The same native runtime and
 shadPS4-based Vulkan renderer as the Windows build, with the same launcher, built for Linux.
+Releases ship only the Windows zip for now, so the AppImage is built from the repository (see
+[Building it yourself](#building-it-yourself)).
 
-> **No game files are included.** You need your own copy of MediEvil (CUSA11227, version 01.00),
-> as an unpacked folder (with `eboot.bin`) or a fake package (`.pkg`).
+> **No game files are included.** You need your own copy of MediEvil (CUSA11227, or the European
+> CUSA12982; version 01.00 or 01.02), as an unpacked folder (with `eboot.bin`) or a fake package
+> (`.pkg`).
 
 ## Run it
 
@@ -61,11 +64,13 @@ to `APPIMAGE_EXTRACT_AND_RUN=1 %command% --play`.
 From the repository, on a distribution with the requirement above (the AppImage needs the glibc
 of the system it was built on, so build on the oldest one you want to support):
 
-1. Dependencies: Clang 18+ (the GPU library uses C++23 features GCC 13 lacks; GCC 14+ also
-   works), CMake, Ninja, pkg-config, Python 3, glslang, and the development files of the Vulkan
-   loader and headers (1.4), SDL3, FFmpeg (libavcodec, libavformat, libavutil, libswscale,
-   libswresample), Boost (headers), fmt, tsl-robin-map, xxHash, Zydis, VulkanMemoryAllocator and
-   libX11. `shell.nix` lists them for Nix.
+1. Dependencies: Clang 18+ (the GPU library uses C++23 features GCC 13 lacks, and GCC 14 stops
+   at the `_Static_assert` in `src/actor_hook.h`, which GCC does not accept in C++), CMake, Ninja,
+   pkg-config, Python 3, glslang, and the development files of the Vulkan loader and headers
+   (1.4.363 builds it; 1.4.328 is too old: it has neither `VK_DRIVER_ID_MESA_KOSMICKRISP` nor
+   `VK_VALVE_shader_mixed_float_dot_product`), SDL3, FFmpeg (libavcodec, libavformat,
+   libavutil, libswscale, libswresample), Boost (headers), fmt, tsl-robin-map, xxHash, Zydis,
+   VulkanMemoryAllocator and libX11. `shell.nix` lists them for Nix.
 2. Build: `CC=clang CXX=clang++ bash build.sh`
 3. Package: `bash packaging/linux/appimage.sh` → `dist/MediEvil-x86_64.AppImage`. It downloads
    appimagetool 1.9.1, the type2 AppImage runtime 20251108, Python 3.13.16 (python-build-standalone
