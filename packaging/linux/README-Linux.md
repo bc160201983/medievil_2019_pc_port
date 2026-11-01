@@ -50,7 +50,9 @@ to `APPIMAGE_EXTRACT_AND_RUN=1 %command% --play`.
   Pop!_OS 24.04+, Fedora 39+, Debian 13+, Arch/Manjaro/EndeavourOS, openSUSE Tumbleweed.
   On an older system the AppImage says so and exits.
 - A Vulkan 1.3 GPU driver: Mesa (RADV for AMD, ANV for Intel) or NVIDIA's driver. The AppImage
-  uses your system's driver.
+  uses your system's driver. With Mesa 25.0 RADV the game runs and plays its sound, but its
+  picture stays black (seen with 25.0.7 on an RX 6800 XT and on a Ryzen 7000 integrated GPU);
+  Mesa 25.3 shows it on the same GPUs.
 - An X11 or Wayland desktop (on Wayland the game window runs through XWayland), or Steam Deck
   Game Mode. Audio through PipeWire (most desktops and SteamOS) or ALSA. Controllers through
   SDL3 (DualSense, DualShock 4, Xbox and others), keyboard too.
