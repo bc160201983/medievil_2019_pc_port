@@ -153,33 +153,12 @@ void WindowSDL::UpdateTextTitle() {
     Gow3Overlay::SetTextEntry(text_active, text_prompt, text);
 }
 
-// The mouse pointer hides while the game is played with a pad and comes back when the mouse moves.
-void WindowSDL::UpdateCursor(const SDL_Event& event) {
-    bool pad = false;
-    switch (event.type) {
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-        pad = true;
-        break;
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-        pad = event.gaxis.value > 16000 || event.gaxis.value < -16000; // past stick drift
-        break;
-    case SDL_EVENT_MOUSE_MOTION:
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:
-    case SDL_EVENT_MOUSE_WHEEL:
-        if (cursor_hidden) {
-            cursor_hidden = false;
-            SDL_ShowCursor();
-        }
-        return;
-    case SDL_EVENT_GAMEPAD_ADDED:
-        std::printf("Window: SDL gamepad added (id %u)\n", static_cast<unsigned>(event.gdevice.which));
-        return;
-    default:
-        return;
-    }
-    if (pad && !cursor_hidden) {
-        cursor_hidden = true;
-        SDL_HideCursor();
+// SDL's gamepad-added events are logged: tells an SDL detection problem apart from a runtime one
+// (PR #64). The pointer itself follows UpdateCursor() below.
+static void LogGamepadAdded(const SDL_Event& event) {
+    if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
+        std::printf("Window: SDL gamepad added (id %u)
+", static_cast<unsigned>(event.gdevice.which));
     }
 }
 
@@ -201,7 +180,7 @@ bool WindowSDL::PollEvents() {
     }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        UpdateCursor(event);
+        LogGamepadAdded(event);
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
             std::scoped_lock lock{text_mutex};
             if (event.type == SDL_EVENT_TEXT_INPUT) {

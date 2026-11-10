@@ -50,8 +50,6 @@ private:
     int text_state{};
     std::string text, text_prompt, base_title;
     void UpdateTextTitle();
-    bool cursor_hidden{}; ///< pointer hidden while a pad plays (window thread)
-    void UpdateCursor(const SDL_Event& event);
     SDL_Window* window{};
     WindowSystemInfo window_info{};
 };
