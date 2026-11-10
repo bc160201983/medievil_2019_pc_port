@@ -56,6 +56,19 @@ jobs:
           export MSYS2_ROOT="$(cygpath -u "$(cygpath -m /)")"
           bash build.sh
 
+      # gow3_dlss.dll (gpu/dlss_bridge): MSVC with only the parts of NVIDIA's DLSS SDK it links
+      # (headers, nvsdk_ngx_s.lib, license). NVIDIA's nvngx_dlss.dll is not shipped (package.sh).
+      - name: DLSS bridge
+        env:
+          CMAKE_EXE: cmake
+        run: |
+          sdk="$(cygpath -u "$RUNNER_TEMP")/DLSS"
+          git clone -q --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS "$sdk"
+          git -C "$sdk" sparse-checkout set --no-cone /include/ /lib/Windows_x86_64/x64/nvsdk_ngx_s.lib \
+              /lib/Windows_x86_64/rel/nvngx_dlss.dll /LICENSE.txt
+          DLSS_SDK_ROOT="$sdk" bash packaging/windows/build_dlss.sh
+          rm -f out/nvngx_dlss.dll
+
       - name: Package
         run: |
           export MSYS2_ROOT="$(cygpath -u "$(cygpath -m /)")"

@@ -54,6 +54,8 @@ done
 # NVIDIA's nvngx_dlss.dll does not (below): players copy it into bin\ themselves.
 if [[ -f out/gow3_dlss.dll ]]; then
     cp out/gow3_dlss.dll "$dest/bin/"
+    # It links NVIDIA's NGX library: NVIDIA's license goes with it.
+    if [[ -f out/NVIDIA-DLSS-LICENSE.txt ]]; then cp out/NVIDIA-DLSS-LICENSE.txt "$dest/bin/"; fi
 fi
 # Every DLL the executables load from the CLANG64 tree (SDL3, FFmpeg, Vulkan loader, ...).
 ldd "$dest/bin/medievil-runtime.exe" "$dest/bin/medievil-gpu-check.exe" |
