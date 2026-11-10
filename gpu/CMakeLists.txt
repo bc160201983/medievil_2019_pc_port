@@ -13,9 +13,15 @@ add_compile_options(-fno-omit-frame-pointer)
 
 # gow3: link-time optimization (GOW3_LTO, default on) and profile-guided optimization
 # (GOW3_PGO: off, generate = instrumented build writing into GOW3_PGO_DIR, use = build with that
-# profile). Covers gow3gpu and the static libraries linked into it. No -march: the same build
-# runs on the Steam Deck.
+# profile). Covers gow3gpu and the static libraries linked into it. No -march by default: the
+# same build runs on the Steam Deck (GOW3_CPU_LEVEL below: the opt-in x86-64-v3 flavour).
 option(GOW3_LTO "Link-time optimization of gow3gpu" ON)
+# gow3 #6 (gpu/shim/gow3_cacheline.h): OFF keeps the cross-thread scheduler / draw pipe fields
+# packed as before (no alignas(64) groups). Every target here sees the same value.
+option(GOW3_CACHELINE_PADDING "Cache-line aligned cross-thread fields" ON)
+if (NOT GOW3_CACHELINE_PADDING)
+    add_compile_definitions(GOW3_CACHELINE_PADDING=0)
+endif()
 set(GOW3_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(GOW3_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
 if (GOW3_LTO)
@@ -38,6 +44,25 @@ elseif (GOW3_PGO STREQUAL "use")
     # (or built differently for it, gow3gpu_init) are compiled without it.
     add_compile_options(-fprofile-use=${GOW3_PGO_DIR} -fprofile-partial-training
                         -fprofile-correction -Wno-missing-profile -Wno-coverage-mismatch)
+endif()
+# gow3 S1 (research/docs/study-deck-build-optimization.md sections 2 and 5;
+# impl-deck-build-sched-pool.md): GOW3_CPU_LEVEL=v3 builds every target here (the library, the
+# third-party libraries built with it, the runtime C, the tests) for x86-64-v3 CPUs (AVX2, BMI1/2,
+# FMA, MOVBE: Intel Haswell, AMD Zen and newer), tuned for Zen 2 (the Steam Deck), without errno
+# from math functions, and links them with lld. Its AppImage refuses to start on an older CPU
+# (packaging/linux/AppRun). -ffp-contract=off: no a*b+c becomes an FMA, so float results (the
+# shader recompiler's constant folding, pacing and scaling math) stay those of the default build;
+# only instruction selection and tuning change. Empty (default): x86-64 baseline, the default linker.
+set(GOW3_CPU_LEVEL "" CACHE STRING "Host CPU level: empty (x86-64 baseline) or v3 (Linux)")
+if (GOW3_CPU_LEVEL STREQUAL "v3")
+    if (WIN32)
+        message(FATAL_ERROR "GOW3_CPU_LEVEL=v3 is a Linux build flavour")
+    endif()
+    add_compile_options(-march=x86-64-v3 -mtune=znver2 -fno-math-errno -ffp-contract=off)
+    # The link sees -march too: the LTO code generator then targets the same CPU.
+    add_link_options(-fuse-ld=lld -march=x86-64-v3 -mtune=znver2)
+elseif (NOT GOW3_CPU_LEVEL STREQUAL "")
+    message(FATAL_ERROR "GOW3_CPU_LEVEL: empty or v3, not '${GOW3_CPU_LEVEL}'")
 endif()
 
 find_package(Vulkan REQUIRED)
@@ -124,6 +149,8 @@ add_host_shader(depth_resample.frag depth_resample_frag)
 add_host_shader(depth_resample.frag depth_stencil_resample_frag HAS_STENCIL=1)
 add_host_shader(depth_resample.frag depth_stencil_bits_frag STENCIL_BITS=1)
 add_host_shader(camera_motion.comp camera_motion_debug_comp DEBUG_OVERLAY=1)
+add_host_shader(ue4_motion.comp ue4_motion_comp)
+add_host_shader(ue4_motion_view.comp ue4_motion_view_comp)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
@@ -143,8 +170,12 @@ file(GLOB AVPLAYER CONFIGURE_DEPENDS shadps4/core/libraries/avplayer/*.cpp)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale libswresample)
 file(GLOB SHIM_SOURCES CONFIGURE_DEPENDS shim/*.cpp shim/*/*.cpp)
 # Windows: a DLL cannot leave the runtime_* symbols for medievil-runtime.exe to resolve, so the
-# library is static there and linked into the executable.
-if (WIN32)
+# library is static there and linked into the executable. Linux: the same with GOW3_STATIC_GPU
+# (default; study-deck-platform-optimization.md B1): calls between the runtime and the library
+# and inside the library are direct instead of through the PLT, thread_locals are local-exec, and
+# the runtime C joins the library's ThinLTO unit. OFF: libgow3gpu.so, linked by build.sh.
+option(GOW3_STATIC_GPU "Link gow3gpu into medievil-runtime (Linux; always on Windows)" ON)
+if (WIN32 OR GOW3_STATIC_GPU)
     set(GOW3GPU_KIND STATIC)
 else()
     set(GOW3GPU_KIND SHARED)
@@ -170,7 +201,20 @@ target_compile_definitions(gow3gpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(gow3gpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against medievil-runtime.
 if (NOT WIN32)
-    target_link_options(gow3gpu PRIVATE -Wl,--allow-shlib-undefined)
+    if (GOW3GPU_KIND STREQUAL "SHARED")
+        target_link_options(gow3gpu PRIVATE -Wl,--allow-shlib-undefined)
+    else()
+        # Calls into libc, libstdc++ and the other shared libraries through the GOT, without a
+        # PLT stub (impl-deck-cpu-bundle.md, static GPU library).
+        target_compile_options(gow3gpu PRIVATE -fno-plt)
+    endif()
+    # gow3 (spacepepperoni/medievil_ps4_Linux 7800f32, impl-deck-cpu-bundle.md D1): the library's
+    # thread_locals in the static TLS block, reached by a fixed offset from %fs instead of a
+    # __tls_get_addr call per access (~3% of the draw recording thread on Linux). Valid because
+    # medievil-runtime and the tests link the library at start (DT_NEEDED, never dlopen'd): its
+    # TLS is sized into the initial block, so glibc's dlopen surplus does not limit it. Linked
+    # statically (GOW3_STATIC_GPU), the accesses become local-exec.
+    target_compile_options(gow3gpu PRIVATE -ftls-model=initial-exec)
 endif()
 target_link_libraries(gow3gpu PRIVATE ffx-vulkan::portable ffx-vulkan::fsr4-v07-vulkan)
 target_link_libraries(gow3gpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
@@ -192,15 +236,18 @@ else()
     target_link_libraries(gow3gpu PUBLIC PkgConfig::X11)
 endif()
 
-# gow3 (Windows): gow3gpu is a static library there, so the loader and the HLE runtime are
-# linked here, where CMake knows its dependencies (build.sh builds them with ninja).
-if (WIN32)
-    enable_language(RC)
+# gow3: when gow3gpu is a static library (Windows; Linux with GOW3_STATIC_GPU), the loader and
+# the HLE runtime are linked here, where CMake knows its dependencies (build.sh builds them with
+# ninja).
+if (GOW3GPU_KIND STREQUAL "STATIC")
     file(GLOB GOW3_RUNTIME CONFIGURE_DEPENDS ../src/runtime*.c)
     file(GLOB GOW3_ATRAC9 CONFIGURE_DEPENDS ../third_party/LibAtrac9/C/src/*.c)
     add_library(atrac9 STATIC ${GOW3_ATRAC9})
     target_compile_options(atrac9 PRIVATE -w)
     set_target_properties(atrac9 PROPERTIES C_STANDARD 99 INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
+if (WIN32)
+    enable_language(RC)
     add_executable(medievil-runtime ../src/probe.c ${GOW3_RUNTIME} ../src/compat_win.c ../src/vulkan_smoke.c
         ../packaging/windows/medievil-runtime.rc)
     set_target_properties(medievil-runtime PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
@@ -231,6 +278,22 @@ if (WIN32)
     add_executable(medievil-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
     target_compile_options(medievil-play PRIVATE -municode)
     target_link_options(medievil-play PRIVATE -municode)
+elseif (GOW3_STATIC_GPU)
+    # Linux: build.sh's runtime flags (C11, asserts on: no NDEBUG). -no-pie keeps the brk heap
+    # below 1 TiB (src/probe.c); -rdynamic keeps host function names in the fault and thread dumps
+    # (dladdr). runtime-test and sema-test (build.sh --test) are linked the same way.
+    function(gow3_runtime_executable name)
+        add_executable(${name} ${ARGN} ${GOW3_RUNTIME})
+        set_target_properties(${name} PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF POSITION_INDEPENDENT_CODE OFF)
+        target_compile_options(${name} PRIVATE -UNDEBUG -fno-plt -pthread -Wall -Wextra -Werror)
+        target_include_directories(${name} PRIVATE .. ../src)
+        target_link_libraries(${name} PRIVATE gow3gpu atrac9 Vulkan::Vulkan m -pthread)
+        target_link_options(${name} PRIVATE -no-pie -rdynamic)
+    endfunction()
+    gow3_runtime_executable(medievil-runtime ../src/probe.c ../src/vulkan_smoke.c)
+    gow3_runtime_executable(runtime-test ../tests/test_runtime.c)
+    gow3_runtime_executable(sema-test ../tests/test_sema.c)
+    set_target_properties(runtime-test sema-test PROPERTIES EXCLUDE_FROM_ALL ON)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
@@ -260,6 +323,20 @@ if (WIN32)
         -include ${CMAKE_CURRENT_SOURCE_DIR}/../src/compat_win.h)
     target_link_libraries(pipeline-binary-initialization-test PRIVATE onecore)
 endif()
+add_executable(draw-pipe-drain-test EXCLUDE_FROM_ALL ../tests/test_draw_pipe_drain.cpp)
+target_compile_definitions(draw-pipe-drain-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(draw-pipe-drain-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(draw-pipe-drain-test PRIVATE gow3gpu)
+target_compile_options(draw-pipe-drain-test PRIVATE -fPIC -UNDEBUG)
+if (WIN32)
+    target_compile_options(draw-pipe-drain-test PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/shim/gow3_win_compat.h)
+endif()
+add_executable(signal-wait-test EXCLUDE_FROM_ALL ../tests/test_signal_wait.cpp)
+target_compile_definitions(signal-wait-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(signal-wait-test PRIVATE shim)
+target_link_libraries(signal-wait-test PRIVATE gow3gpu)
+target_compile_options(signal-wait-test PRIVATE -UNDEBUG)
 set_source_files_properties(../tests/test_pipeline_binary_cache.cpp PROPERTIES
     COMPILE_OPTIONS "-fvisibility=hidden;-fvisibility-inlines-hidden")
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
@@ -344,6 +421,9 @@ add_executable(perf-overlay-test EXCLUDE_FROM_ALL ../tests/test_perf_overlay.cpp
     shim/gow3_settings.cpp)
 target_include_directories(perf-overlay-test PRIVATE shim)
 target_compile_options(perf-overlay-test PRIVATE -UNDEBUG)
+add_executable(draw-classes-test EXCLUDE_FROM_ALL ../tests/test_draw_classes.cpp)
+target_include_directories(draw-classes-test PRIVATE shim)
+target_compile_options(draw-classes-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(cheat-hooks-test EXCLUDE_FROM_ALL ../tests/test_cheat_hooks.cpp)
 target_compile_options(cheat-hooks-test PRIVATE -UNDEBUG)
 add_executable(readback-queue-test EXCLUDE_FROM_ALL ../tests/test_readback_queue.cpp)
@@ -352,6 +432,10 @@ target_compile_options(readback-queue-test PRIVATE -UNDEBUG -Wall -Wextra -Werro
 add_executable(wait-diagnostics-test EXCLUDE_FROM_ALL ../tests/test_wait_diagnostics.cpp)
 target_include_directories(wait-diagnostics-test PRIVATE shadps4)
 target_compile_options(wait-diagnostics-test PRIVATE -UNDEBUG)
+add_executable(ue4-frame-map-test EXCLUDE_FROM_ALL ../tests/test_ue4_frame_map.cpp
+    shadps4/video_core/renderer_vulkan/vk_ue4_frame_map.cpp)
+target_include_directories(ue4-frame-map-test PRIVATE shadps4)
+target_compile_options(ue4-frame-map-test PRIVATE -UNDEBUG)
 add_executable(graphics-settings-test EXCLUDE_FROM_ALL ../tests/test_graphics_settings.cpp
     shim/gow3_settings.cpp)
 target_include_directories(graphics-settings-test PRIVATE shim)
@@ -362,6 +446,20 @@ target_compile_options(actor-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(readback-sources-test EXCLUDE_FROM_ALL ../tests/test_readback_sources.cpp)
 target_include_directories(readback-sources-test PRIVATE shadps4)
 target_compile_options(readback-sources-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(texset-table-test EXCLUDE_FROM_ALL ../tests/test_texset_table.cpp
+    shim/gow3_texset_table.cpp)
+target_include_directories(texset-table-test PRIVATE shim)
+target_compile_options(texset-table-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(pending-pages-test EXCLUDE_FROM_ALL ../tests/test_pending_pages.cpp)
+target_include_directories(pending-pages-test PRIVATE shim)
+target_compile_options(pending-pages-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(stage-a-hash-test EXCLUDE_FROM_ALL ../tests/test_stage_a_hash.cpp)
+target_include_directories(stage-a-hash-test PRIVATE shim)
+target_compile_options(stage-a-hash-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(resident-blocks-test EXCLUDE_FROM_ALL ../tests/test_resident_blocks.cpp)
+target_include_directories(resident-blocks-test PRIVATE shim shadps4)
+# -Wno-sign-compare: shadPS4's interval_set.h (IntervalList::Splice).
+target_compile_options(resident-blocks-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-sign-compare)
 add_executable(page-state-test EXCLUDE_FROM_ALL ../tests/test_page_state.cpp)
 target_include_directories(page-state-test PRIVATE ../tests/stubs shim shadps4)
 target_link_libraries(page-state-test PRIVATE Boost::headers)

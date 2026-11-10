@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -33,6 +36,21 @@ public:
 
     /// Presents the current image and move to the next one
     bool Present();
+
+    /// gow3 flip trace: the guest flip argument of the next present (-1: not a game flip).
+    void SetPresentTag(s64 tag) {
+        present_tag = tag;
+    }
+    [[nodiscard]] s64 PresentTag() const {
+        return present_tag;
+    }
+
+    /// gow3 Reflex (VK_NV_low_latency2): the driver's minimum frame interval (0: no limit),
+    /// applied now and to every recreated swapchain.
+    void SetLatencyInterval(u32 interval_us);
+    /// gow3 Reflex: blocks until the driver says the next frame should start, then marks its
+    /// simulation start. False without Reflex.
+    bool LatencySleep();
 
     vk::SurfaceKHR GetSurface() const {
         return surface;
@@ -139,6 +157,27 @@ private:
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
+
+    // gow3 flip trace display times (Instance::IsPresentWaitEnabled): presents waited for in
+    // order on their own thread; Destroy holds wait_mutex so no wait runs on a dying swapchain.
+    void DisplayWaitThread(std::stop_token token);
+    struct PendingPresent {
+        vk::SwapchainKHR swapchain;
+        u64 id;
+        s64 tag;
+    };
+    s64 present_tag = -1;
+    u64 present_id = 0;
+    void ApplyLatencyMode();
+    void LatencyMarker(vk::LatencyMarkerNV marker, u64 id);
+    u32 latency_interval_us = 0;
+    vk::Semaphore latency_semaphore{};
+    u64 latency_value = 0;
+    std::mutex wait_mutex;
+    std::mutex pending_mutex;
+    std::condition_variable_any pending_cv;
+    std::deque<PendingPresent> pending;
+    std::jthread display_wait_thread;
 };
 
 } // namespace Vulkan

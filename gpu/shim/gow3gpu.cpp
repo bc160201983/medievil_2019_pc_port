@@ -7,6 +7,7 @@
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#include "gow3_sections.h"
 #include "gow3_toggles.h"
 #include <algorithm>
 #include <atomic>
@@ -27,8 +28,10 @@
 #include "common/rdtsc.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
+#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
+#include "gow3_gpu_fences.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -36,6 +39,9 @@ extern "C" {
 // runtime_memory.c
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_write_backing(uintptr_t address, const void* data, uint64_t size);
+int runtime_memory_store_label(uintptr_t address, uint64_t value, uint32_t size);
+int runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
+int runtime_memory_copy_backing(uintptr_t address, void* data, uint64_t size);
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write);
@@ -46,6 +52,8 @@ uint64_t runtime_process_time_counter(void);
 uint64_t runtime_tsc_frequency(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
+void runtime_memory_set_precise_write_hook(int (*hook)(uintptr_t address, const void* src, int value,
+                                                        uint64_t size));
 }
 
 Frontend::WindowSDL* g_window = nullptr;
@@ -98,14 +106,29 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
         [](uintptr_t address, uint64_t size) {
             Memory::Instance()->GetRasterizer()->InvalidateMemory(address, size);
         });
+    // gow3: the guest's libc writes into memory a shader wrote (see BufferCache::PreciseCpuWrite).
+    runtime_memory_set_precise_write_hook([](uintptr_t address, const void* src, int value, uint64_t size) {
+        return Memory::Instance()->GetRasterizer()->PreciseCpuWrite(address, src, value, size) ? 1 : 0;
+    });
 }
 void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
     if (rasterizer) rasterizer->InvalidateMemory(address, size);
 }
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
+    GOW3_SECTION(Clamp);
     return runtime_memory_clamp(virtual_addr, size);
 }
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
+#ifndef _WIN32
+    // gow3 A1 (impl-stage-a-decode.md; GOW3_BACKING_COPY=1, second toggle word 1048576 off): the
+    // same bytes through the backing view without the region table lock; 0: the loop below.
+    if (runtime_memory_copy_backing(source, dest, size)) {
+        return;
+    }
+#endif
+#ifndef _WIN32
+    bool retried = false;
+#endif
     while (size) {
         uintptr_t start = 0, end = 0;
         int mapped = 0;
@@ -113,8 +136,32 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             end = source + size;
         }
         const u64 n = std::min<u64>(size, end - source);
+#ifndef _WIN32
+        // Linux: through the backing view, under the region lock, never through the guest
+        // mapping. Linux unmaps a pool page on every decommit (Windows keeps the view), and UE4
+        // recommits pool pages several times a frame: a copy thread reading the guest mapping
+        // crashed in CopySparseMemory (signal 11, Deck native run 7). From
+        // spacepepperoni/medievil_ps4_Linux 97f0ac9 (GPL-2.0). The lookup above is lock-free, so
+        // the range can be decommitted or split before the locked read: then read_backing fails,
+        // and the old fall-through memcpy from the now PROT_NONE guest address crashed the same way
+        // (native run 5, native run 7, nav-1: libc memcpy at a 1 MiB boundary). Look it up once
+        // more; a range still unreadable reads as zeros, as an unmapped one does.
+        if (mapped) {
+            if (!runtime_memory_read_backing(source, dest, n)) {
+                if (!retried) {
+                    retried = true;
+                    continue;
+                }
+                std::memset(dest, 0, n);
+            }
+        } else {
+            std::memset(dest, 0, n);
+        }
+        retried = false;
+#else
         if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         else std::memset(dest, 0, n);
+#endif
         source += n; dest += n; size -= n;
     }
 }
@@ -129,9 +176,39 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
         CopySparseSerial(source + offset, dest + offset, std::min(Chunk, size - offset));
     });
 }
+bool MemoryManager::ReadBacking(VAddr address, void* data, u64 size) {
+    return runtime_memory_read_backing(address, data, size) != 0;
+}
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     Gow3WriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, Gow3WriteLog::Backing);
     return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
+}
+bool MemoryManager::StoreLabel(void* address, u64 value, u32 size, bool backing) {
+    // gow3 GOW3_GPU_FENCES: Bloodborne 0.7's StoreLabel (0fc2921, gpu/cp/cp_tasks.cpp): one store,
+    // not memcpy's two overlapping ones (a label rewritten after the guest freed its block).
+    const auto at = reinterpret_cast<uintptr_t>(address);
+    if (backing) {
+        Gow3WriteLog::Note(at, &value, size, Gow3WriteLog::Backing);
+        if (runtime_memory_store_label(at, value, size)) {
+            return true;
+        }
+    }
+    // Written once the GPU is done, which may be after the guest unmapped the memory.
+    if (!runtime_memory_is_mapped(at, size)) {
+        Gow3GpuFences::counters.labels_unmapped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (size == 8 && !(at & 7)) {
+        __atomic_store_n(static_cast<u64*>(address), value, __ATOMIC_RELEASE);
+    } else if (size == 4 && !(at & 3)) {
+        __atomic_store_n(static_cast<u32*>(address), u32(value), __ATOMIC_RELEASE);
+    } else {
+        auto* bytes = static_cast<u8*>(address);
+        for (u32 i = 0; i < size; ++i) {
+            __atomic_store_n(bytes + i, u8(value >> (8 * i)), __ATOMIC_RELEASE);
+        }
+    }
+    return true;
 }
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     Gow3Stats::Timer timer{Gow3Stats::t_protect};
@@ -221,7 +298,8 @@ extern "C" int gow3gpu_init(const Gow3GpuConfig* config) {
 #endif
     Core::Emulator::FillElfInfo(*config);
     const std::string title = config->title ? config->title : "MediEvil";
-    const s32 width = config->width, height = config->height;
+    // The window starts at the game's output size (GOW3_INTERNAL_WIDTH/HEIGHT, the VideoOut's).
+    const s32 width = s32(EmulatorSettings.GetInternalScreenWidth()), height = s32(EmulatorSettings.GetInternalScreenHeight());
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("gow3:window");
         auto* window = new Frontend::WindowSDL(width, height, title.c_str());

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "gow3_flip_trace.h"
 #include <algorithm>
+#include <string_view>
 #include <cstdio>
 #include <limits>
 #include "common/assert.h"
@@ -29,7 +31,36 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
 }
 
+void Swapchain::DisplayWaitThread(std::stop_token token) {
+    while (!token.stop_requested()) {
+        PendingPresent next{};
+        {
+            std::unique_lock lock{pending_mutex};
+            if (!pending_cv.wait(lock, token, [&] { return !pending.empty(); })) {
+                return;
+            }
+            next = pending.front();
+            pending.pop_front();
+        }
+        for (int tries = 0; tries < 100 && !token.stop_requested(); ++tries) {
+            std::scoped_lock lock{wait_mutex};
+            if (swapchain != next.swapchain) {
+                break; // recreated: its presents are gone
+            }
+            const auto result = instance.GetDevice().waitForPresentKHR(swapchain, next.id, 2000000);
+            if (result == vk::Result::eSuccess) {
+                Gow3FlipTrace::Note("displayed", next.tag);
+                break;
+            }
+            if (result != vk::Result::eTimeout) {
+                break;
+            }
+        }
+    }
+}
+
 Swapchain::~Swapchain() {
+    display_wait_thread = {};
     Destroy();
     instance.GetInstance().destroySurfaceKHR(surface);
 }
@@ -53,7 +84,9 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const vk::SharingMode sharing_mode =
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
+    const vk::SwapchainLatencyCreateInfoNV latency_info = {.latencyModeEnable = true};
     const vk::SwapchainCreateInfoKHR swapchain_info = {
+        .pNext = instance.IsLowLatency2Enabled() ? &latency_info : nullptr,
         .surface = surface,
         .minImageCount = image_count,
         .imageFormat = format.format,
@@ -79,6 +112,59 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     SetupImages();
     RefreshSemaphores();
+    ApplyLatencyMode();
+}
+
+void Swapchain::SetLatencyInterval(u32 interval_us) {
+    latency_interval_us = interval_us;
+    ApplyLatencyMode();
+}
+
+void Swapchain::ApplyLatencyMode() {
+    if (!instance.IsLowLatency2Enabled() || !swapchain) {
+        return;
+    }
+    const vk::LatencySleepModeInfoNV mode = {
+        .lowLatencyMode = true,
+        .lowLatencyBoost = false,
+        .minimumIntervalUs = latency_interval_us,
+    };
+    const auto result = instance.GetDevice().setLatencySleepModeNV(swapchain, &mode);
+    std::printf("Swapchain: Reflex sleep mode, minimum interval %u us (%s)\n", latency_interval_us,
+                vk::to_string(result).c_str());
+}
+
+void Swapchain::LatencyMarker(vk::LatencyMarkerNV marker, u64 id) {
+    if (!instance.IsLowLatency2Enabled() || !swapchain) {
+        return;
+    }
+    const vk::SetLatencyMarkerInfoNV info = {.presentID = id, .marker = marker};
+    instance.GetDevice().setLatencyMarkerNV(swapchain, &info);
+}
+
+bool Swapchain::LatencySleep() {
+    if (!instance.IsLowLatency2Enabled() || !swapchain) {
+        return false;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (!latency_semaphore) {
+        const vk::SemaphoreTypeCreateInfo type = {.semaphoreType = vk::SemaphoreType::eTimeline,
+                                                  .initialValue = 0};
+        const vk::SemaphoreCreateInfo info = {.pNext = &type};
+        auto [result, semaphore] = device.createSemaphore(info);
+        if (result != vk::Result::eSuccess) {
+            return false;
+        }
+        latency_semaphore = semaphore;
+    }
+    const vk::LatencySleepInfoNV sleep = {.signalSemaphore = latency_semaphore, .value = ++latency_value};
+    if (device.latencySleepNV(swapchain, &sleep) == vk::Result::eSuccess) {
+        const vk::SemaphoreWaitInfo wait = {
+            .semaphoreCount = 1, .pSemaphores = &latency_semaphore, .pValues = &latency_value};
+        (void)device.waitSemaphores(&wait, 100'000'000); // at most 100 ms
+    }
+    LatencyMarker(vk::LatencyMarkerNV::eSimulationStart, present_id + 1);
+    return true;
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
@@ -130,15 +216,43 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
-    const vk::PresentInfoKHR present_info = {
+    vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
         .pImageIndices = &image_index,
     };
+    const u64 id = ++present_id;
+    const vk::PresentIdKHR present_id_info = {
+        .swapchainCount = 1,
+        .pPresentIds = &id,
+    };
+    const bool track = instance.IsPresentWaitEnabled();
+    if (track || instance.IsPresentIdEnabled()) {
+        present_info.pNext = &present_id_info;
+    }
+    // gow3 Reflex markers of this frame (its simulation started after the last LatencySleep).
+    LatencyMarker(vk::LatencyMarkerNV::eSimulationEnd, id);
+    LatencyMarker(vk::LatencyMarkerNV::eRendersubmitStart, id);
+    LatencyMarker(vk::LatencyMarkerNV::eRendersubmitEnd, id);
+    LatencyMarker(vk::LatencyMarkerNV::ePresentStart, id);
+    if (track) {
+        if (!display_wait_thread.joinable()) {
+            display_wait_thread = std::jthread([this](std::stop_token token) { DisplayWaitThread(token); });
+        }
+    }
 
     auto result = instance.GetPresentQueue().presentKHR(present_info);
+    LatencyMarker(vk::LatencyMarkerNV::ePresentEnd, id);
+    if (track && present_tag >= 0 && result == vk::Result::eSuccess) {
+        {
+            std::scoped_lock lock{pending_mutex};
+            pending.push_back({swapchain, id, present_tag});
+        }
+        pending_cv.notify_one();
+    }
+    present_tag = -1;
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
@@ -204,6 +318,24 @@ void Swapchain::FindPresentMode() {
     // driver has it, else Immediate (tearing allowed), else Fifo.
     vsync = Gow3Settings::Get().vsync;
     const auto has = [&](vk::PresentModeKHR mode) { return std::ranges::find(modes, mode) != modes.cend(); };
+    // gow3 GOW3_PRESENT_MODE (launcher > Presentation > Present mode): a fixed Vulkan present
+    // mode instead of following VSync; unsupported modes fall back to Fifo.
+    if (const char* forced = std::getenv("GOW3_PRESENT_MODE"); forced && forced[0]) {
+        const std::string_view name{forced};
+        const auto mode = name == "fifo_relaxed" ? vk::PresentModeKHR::eFifoRelaxed
+                          : name == "mailbox"    ? vk::PresentModeKHR::eMailbox
+                          : name == "immediate"  ? vk::PresentModeKHR::eImmediate
+                                                 : vk::PresentModeKHR::eFifo;
+        // Immediate asks for no wait on the display: without it (gamescope offers no Immediate),
+        // Mailbox keeps that, where Fifo would cap the frame rate at the refresh.
+        present_mode = has(mode) ? mode
+                       : mode == vk::PresentModeKHR::eImmediate && has(vk::PresentModeKHR::eMailbox)
+                           ? vk::PresentModeKHR::eMailbox
+                           : vk::PresentModeKHR::eFifo;
+        std::printf("Swapchain: present mode %s (GOW3_PRESENT_MODE=%s%s)\n", vk::to_string(present_mode).c_str(),
+                    forced, present_mode == mode ? "" : ", not offered by the surface");
+        return;
+    }
     present_mode = vsync ? vk::PresentModeKHR::eFifo
                    : has(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
                    : has(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
@@ -257,6 +389,7 @@ void Swapchain::SetSurfaceProperties() {
 }
 
 void Swapchain::Destroy() {
+    std::scoped_lock wait_lock{wait_mutex};
     vk::Device device = instance.GetDevice();
     const auto wait_result = device.waitIdle();
     if (wait_result != vk::Result::eSuccess) {

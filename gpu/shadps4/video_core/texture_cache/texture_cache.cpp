@@ -1,9 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <format>
+#include <limits>
+#include <mutex>
+#include <unordered_set>
 #include <xxhash.h>
 #include "video_core/amdgpu/liverpool.h"
 
+#include "gow3_sections.h"
 #include "gow3_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -25,6 +34,143 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+namespace {
+// gow3 (plan-linux-deck.md "Mausoleum lighting"): a color target or storage image of at most 64
+// texels (and 64 KiB) is copied back to guest memory whatever its tiling (the rule before:
+// linear or at most 8 wide). UE4's sky light lighting is a 9x1 RGBA16F tiled target the CPU reads
+// back once at a level's load: never copied back, the CPU took the bytes left there (zeros on the
+// PC by luck, leftovers on the Deck: the Hilltop Mausoleum lit in wrong colours).
+bool IsTinyTarget(const ImageInfo& info) {
+    return !info.props.is_depth && info.guest_address != 0 && info.guest_size <= 64_KB &&
+           u64{info.size.width} * info.size.height * info.size.depth * info.resources.layers <= 64;
+}
+
+float HalfToFloat(u16 h) {
+    const u32 sign = (h >> 15) & 1, exponent = (h >> 10) & 31, mantissa = h & 1023;
+    float value;
+    if (exponent == 0) {
+        value = std::ldexp(float(mantissa), -24);
+    } else if (exponent == 31) {
+        value = mantissa ? std::numeric_limits<float>::quiet_NaN()
+                         : std::numeric_limits<float>::infinity();
+    } else {
+        value = std::ldexp(float(mantissa | 1024), int(exponent) - 25);
+    }
+    return sign ? -value : value;
+}
+
+/// GOW3_READBACK_LOG: up to `max` 8-byte groups of `data` that are not zero, as offset and four
+/// half floats (where a tiny RGBA16F target's texels landed in its guest copy).
+std::string NonZeroTexels(const u8* data, u64 size, u32 max) {
+    std::string out;
+    u32 found = 0;
+    for (u64 offset = 0; offset + 8 <= size && found < max; offset += 8) {
+        u16 h[4];
+        std::memcpy(h, data + offset, 8);
+        if ((h[0] | h[1] | h[2] | h[3]) == 0) {
+            continue;
+        }
+        out += std::format(" +{}:({:.5g} {:.5g} {:.5g} {:.5g})", offset, HalfToFloat(h[0]),
+                           HalfToFloat(h[1]), HalfToFloat(h[2]), HalfToFloat(h[3]));
+        ++found;
+    }
+    return out.empty() ? std::string(" all zero") : out;
+}
+} // namespace
+
+namespace {
+// gow3: GOW3_TEXCACHE_STATS=1 (diagnostics): what the cache does per 5 s, printed after a
+// submission's collector run. MediEvil lost FPS the longer a level was played and a restart
+// restored it: these show which part grows. Off: one load per counter.
+struct CacheStats {
+    std::atomic<u64> fast_lookups, slow_lookups, slow_candidates, overlaps, expands, registered,
+        unregistered, refreshes, refresh_bytes, alias_copies, alias_syncs, volume_views, unmap_frees,
+        unmap_free_bytes, recreated, recreated_bytes, eop_waits, eop_skips, undefined_targets,
+        undefined_target_bytes, cleared_targets, cleared_target_bytes, gpu_freed_reused,
+        gpu_freed_reused_bytes, parked, parked_reused, parked_evicted;
+};
+CacheStats cache_stats;
+bool CacheStatsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("GOW3_TEXCACHE_STATS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+#define CACHE_STAT(name, n)                                                                       \
+    do {                                                                                           \
+        if (CacheStatsEnabled()) cache_stats.name.fetch_add((n), std::memory_order_relaxed);      \
+    } while (0)
+
+// gow3: GOW3_TEXCACHE_STATS: a render or depth target at the start of a mip of an image with
+// mips, once per kind: whether it resolved as a view of that mip. A rejected one renders into
+// an image of its own and the parent's mip keeps what it held (UE4's HZB is built mip by mip
+// as render targets; small mips are micro tiled, MipOf compared array modes: t-hzb1).
+// merge: an image of its own met by its grown parent, merged into the mip or kept apart.
+void NoteMipTarget(const ImageInfo& target, const ImageInfo& parent, s32 mip, s32 slice,
+                   bool merge) {
+    if (!CacheStatsEnabled() || target.resources.levels != 1) {
+        return;
+    }
+    s32 at = -1;
+    for (u32 m = 1; m < parent.resources.levels; ++m) {
+        if (target.guest_address == parent.guest_address + parent.mips_layout[m].offset) {
+            at = s32(m);
+            break;
+        }
+    }
+    // The next mip, before the image grows to it (a mip's render target comes before its view).
+    const bool next = at < 0 && !merge &&
+                      target.guest_address == parent.guest_address + parent.guest_size;
+    if (at < 0 && !next) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = u64(parent.pixel_format) << 40 ^ u64(parent.size.width) << 26 ^
+                    u64(parent.size.height) << 12 ^ u64(next ? parent.resources.levels : at) << 6 ^
+                    u64(mip + 1) << 3 ^ u64(slice + 1) ^ u64(merge) << 63 ^ u64(next) << 62;
+    std::scoped_lock lock{mutex};
+    if (seen.size() >= 256 || !seen.insert(key).second) {
+        return;
+    }
+    const bool resolved = mip >= 0 && slice >= 0;
+    std::printf("Mip target%s: %ux%u %s L%u at 0x%llx, mip %d%s: target %ux%u pitch %u tile mode %u "
+                "array mode %u, parent tile mode %u array mode %u: %s\n",
+                merge ? " (merge)" : "", parent.size.width, parent.size.height,
+                vk::to_string(parent.pixel_format).c_str(), parent.resources.levels,
+                static_cast<unsigned long long>(parent.guest_address),
+                next ? s32(parent.resources.levels) : at, next ? " (past the image's levels)" : "",
+                target.size.width, target.size.height, target.pitch, u32(target.tile_mode),
+                u32(target.array_mode), u32(parent.tile_mode), u32(parent.array_mode),
+                merge ? (resolved ? "merged into the mip" : "kept apart")
+                      : (resolved ? "view of the mip" : "rejected, own image"));
+    std::fflush(stdout);
+}
+
+// gow3: a volume the guest renders slice by slice and samples as 3D: a 2D render target with
+// one layer per depth slice at the address of a 3D image of the same size. 3D images are
+// created 2D-array compatible, so it renders through a 2D array view of the volume.
+// gow3: GOW3_TEXCACHE_STATS: identifies an image across a free and a later re-creation.
+u64 RecreateKey(const ImageInfo& info) {
+    u64 key = info.guest_address ^ u64(info.guest_size) << 20 ^ u64(info.pixel_format) << 44 ^
+              u64(info.size.width) << 8 ^ u64(info.size.height) << 30;
+    key = (key ^ key >> 33) * 0xFF51AFD7ED558CCDull;
+    return key ^ key >> 33;
+}
+
+bool IsVolumeSliceTarget(const ImageInfo& info, TextureCache::BindingType binding,
+                         const ImageInfo& volume) {
+    return binding == TextureCache::BindingType::RenderTarget &&
+           volume.type == AmdGpu::ImageType::Color3D && info.type != AmdGpu::ImageType::Color3D &&
+           info.size.width == volume.size.width && info.size.height == volume.size.height &&
+           info.resources.layers == volume.size.depth && info.resources.levels == 1 &&
+           volume.resources.levels == 1 &&
+           IsVulkanFormatCompatible(volume.pixel_format, info.pixel_format) &&
+           !Gow3Toggle::Disabled(Gow3Toggle::VolumeSliceViews);
+}
+} // namespace
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
@@ -89,24 +235,102 @@ void TextureCache::WatchReadback(VAddr address, u64 size) {
     }
 }
 
-void TextureCache::RetireReadbacks() {
-    pending_readbacks.Retire([this](u64 tick) { return scheduler.IsFree(tick); },
+template <typename Entry>
+void TextureCache::UnwatchReadback(const Entry& entry) {
+    if (entry.reads) {
+        tracker.UpdatePageWatchers<false, true>(entry.address, entry.size);
+    } else {
+        WatchReadback<false>(entry.address, entry.size);
+    }
+}
+
+void TextureCache::PublishReadbackSpans() {
+    std::array<std::pair<u64, u64>, ReadbackSpanCount> spans{};
+    const std::size_t count = pending_readbacks.Spans(spans);
+    auto& p = readback_spans;
+    const u32 seq = p.seq.load(std::memory_order_relaxed);
+    p.seq.store(seq + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    for (std::size_t i = 0; i < count; ++i) {
+        p.begin[i].store(spans[i].first, std::memory_order_relaxed);
+        p.end[i].store(spans[i].second, std::memory_order_relaxed);
+    }
+    p.count.store(u32(count), std::memory_order_relaxed);
+    p.seq.store(seq + 2, std::memory_order_release);
+}
+
+bool TextureCache::ReadbackSpansMiss(VAddr address, u64 size) const {
+    // A seqlock read: a writer in progress or a changed seq sends the caller to the lock.
+    const auto& p = readback_spans;
+    const u32 seq = p.seq.load(std::memory_order_acquire);
+    if (seq & 1) {
+        return false;
+    }
+    const u32 count = std::min<u32>(p.count.load(std::memory_order_relaxed), ReadbackSpanCount);
+    bool overlap = false;
+    for (u32 i = 0; i < count; ++i) {
+        overlap |= address < p.end[i].load(std::memory_order_relaxed) &&
+                   p.begin[i].load(std::memory_order_relaxed) < address + size;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return !overlap && p.seq.load(std::memory_order_relaxed) == seq;
+}
+
+void TextureCache::RetireReadbacks(bool polled) {
+    const std::size_t queued = pending_readbacks.Size();
+    // gow3 (study-stage-b-per-draw.md C1): `polled` (the end-of-pipe events): a copy the last
+    // known GPU tick does not cover yet retires at a later event (Scheduler::IsFreePolled).
+    pending_readbacks.Retire(
+        [this, polled](u64 tick) { return polled ? scheduler.IsFreePolled(tick) : scheduler.IsFree(tick); },
         [this](auto& entry) {
             if (entry.valid) {
                 entry.payload.Invalidate();
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(entry.address),
                     entry.payload.mapped, entry.size);
-                if (entry.watched) WatchReadback<false>(entry.address, entry.size);
+                if (entry.watched) UnwatchReadback(entry);
+                if (entry.seq) NoteTrackedPublish(entry.address, entry.size, entry.seq);
+                if (stale_readbacks && readback_published.insert(entry.address).second &&
+                    readback_log) {
+                    std::printf("Readback first copy published: %#llx (%llu bytes); non-zero 8-byte "
+                                "groups:%s\n",
+                                static_cast<unsigned long long>(entry.address),
+                                static_cast<unsigned long long>(entry.size),
+                                NonZeroTexels(entry.payload.mapped, entry.size, 16).c_str());
+                }
                 ++readbacks_completed;
             }
             runtime.GetStagingPool().FreeDeferred(entry.payload);
         });
+    if (pending_readbacks.Size() != queued) {
+        PublishReadbackSpans(); // fewer pages: tighter spans (optional, never required)
+    }
     has_pending_readbacks.store(pending_readbacks.Bytes() != 0, std::memory_order_release);
 }
 
 bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
                                     ReadbackSource source) {
     if (!deferred_readbacks || !has_pending_readbacks.load(std::memory_order_acquire)) return false;
+    // gow3 C5 (impl-stage-b-bundle-2.md; study-stage-b-per-draw.md): the buffer cache asks 3-4
+    // times a draw, and with copies always queued each ask took readback_mutex and scanned the
+    // queue. A range on no page of a pending copy needs no lock: the answer would be "nothing
+    // to wait for". Only the buffer cache's calls (the thread that owns the caches, the same
+    // one that queues the copies, or one ordered after it by the draw-pipe drain) skip the
+    // lock; the CPU fault paths keep it: a page is watched before its copy is queued, so a
+    // fault may come before the spans include the copy (the lock waits for that).
+    // Second toggle word 128: always the lock.
+    if (source == ReadbackSource::BufferObtain || source == ReadbackSource::BufferForImage ||
+        source == ReadbackSource::BufferUpload) {
+        if (!Gow3Toggle2::Disabled(Gow3Toggle2::ReadbackPrecheck) &&
+            ReadbackSpansMiss(address, size)) {
+            if (Gow3Stats::enabled) {
+                Gow3Stats::readback_prechecks[0].fetch_add(1, std::memory_order_relaxed);
+            }
+            return false;
+        }
+        if (Gow3Stats::enabled) {
+            Gow3Stats::readback_prechecks[1].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     {
         std::scoped_lock lock{readback_mutex};
         // Stale mode, byte rule: God of War III writes every frame to the page that holds a
@@ -114,7 +338,7 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
         // copy only stops protecting its page and is still published when the GPU is done.
         if (stale_readbacks && source == ReadbackSource::CpuWrite) {
             readbacks_released += pending_readbacks.ReleaseOutside(address, size, 64_KB,
-                [this](auto& entry) { WatchReadback<false>(entry.address, entry.size); });
+                [this](auto& entry) { UnwatchReadback(entry); });
         }
         if (!pending_readbacks.RequiredTick(address, size)) return false;
     }
@@ -135,6 +359,13 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
         if (const u64 tick = pending_readbacks.RequiredTick(address, size)) {
             ++readbacks_waited;
             waited = !scheduler.IsFree(tick);
+            if (readback_log && source == ReadbackSource::CpuRead) {
+                // gow3: in stale mode only a first copy's pages watch reads (GOW3_READBACK_FIRST_WAIT).
+                std::printf("Readback first copy read by the CPU: %#llx (%llu bytes), GPU %s\n",
+                            static_cast<unsigned long long>(address),
+                            static_cast<unsigned long long>(size),
+                            waited ? "not done yet: waiting" : "already done");
+            }
             const auto start = diag ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
             scheduler.Wait(tick);
@@ -151,23 +382,120 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
     return true;
 }
 
+u64 TextureCache::NoteTrackedPush(VAddr address, u64 size) {
+    for (auto& t : tracked_readbacks) {
+        if (t.size && address < t.address + t.size && t.address < address + size) return ++t.pushed;
+    }
+    return 0;
+}
+
+void TextureCache::NoteTrackedPublish(VAddr address, u64 size, u64 seq) {
+    for (auto& t : tracked_readbacks) {
+        if (t.size && address < t.address + t.size && t.address < address + size) {
+            t.published = std::max(t.published, seq);
+            return;
+        }
+    }
+}
+
+TextureCache::ReadbackSnapshot TextureCache::SnapshotReadback(VAddr address, u64 size, void* dst,
+                                                              u64 copy_size, bool restart) {
+    if (!deferred_readbacks || !size) return {};
+    std::scoped_lock lock{readback_mutex};
+    auto it = std::ranges::find_if(tracked_readbacks, [&](const TrackedReadback& t) {
+        return t.address == address && t.size == size;
+    });
+    if (it == tracked_readbacks.end()) {
+        // Copies queued before this call carry no number: their bytes count as copy 0.
+        it = std::ranges::find(tracked_readbacks, u64{0}, &TrackedReadback::size);
+        if (it == tracked_readbacks.end()) return {};
+        *it = {address, size, 0, 0};
+    }
+    RetireReadbacks();
+    if (restart) {
+        *it = {address, size, 0, 0};
+        pending_readbacks.ClearSeq(address, size);
+    }
+    if (copy_size && !Core::Memory::Instance()->ReadBacking(address, dst, std::min(copy_size, size))) {
+        return {};
+    }
+    return {it->pushed, it->published, true};
+}
+
 void TextureCache::CancelReadbacks(VAddr address, u64 size) {
     if (!deferred_readbacks) return;
     std::scoped_lock lock{readback_mutex};
+    const u64 canceled_before = readbacks_canceled;
     pending_readbacks.Cancel(address, size, [this](auto& entry) {
-        if (entry.watched) WatchReadback<false>(entry.address, entry.size);
+        if (entry.watched) UnwatchReadback(entry);
         ++readbacks_canceled;
     });
+    if (readbacks_canceled != canceled_before) {
+        PublishReadbackSpans(); // C5: tighter spans (optional)
+    }
 }
 
 // gow3: every copy is recorded first and the GPU is waited for once. A wait per image (as
 // before) left the GPU mostly idle in God of War III's gameplay, at about 2 FPS.
 void TextureCache::ProcessDownloadImages() {
+    GOW3_SECTION(EndOfPipe);
     if (deferred_readbacks) {
+        // gow3: most ends of pipe (MediEvil: ~3 a frame, ~5 tiny readbacks a frame) have no image
+        // to download and no copy ready to publish; the host copy wait below then protects
+        // nothing, yet it was ~20% of the draw recording thread in heavy views (P2a). Those skip
+        // it; every end of pipe with readback work still waits (skipping those broke the torches,
+        // R1 / V2). Opt-in (GOW3_IDLE_EOP_SKIP=1): +2% in heavy views, but the copies the wait
+        // spread over the frame then land at once and the spikes when a torch comes into view
+        // got deeper (T-P2: worst frames 29-42 ms vs <= 19 ms). Toggle bit 60 turns it off live.
+        static const bool idle_eop_skip = [] {
+            const char* env = std::getenv("GOW3_IDLE_EOP_SKIP");
+            return env && env[0] == '1';
+        }();
+        if (idle_eop_skip && !Gow3Toggle::Disabled(Gow3Toggle::IdleEopSkip)) {
+            bool idle;
+            {
+                std::scoped_lock readback_lock{readback_mutex};
+                std::unique_lock lock{download_images_mutex};
+                idle = download_images.empty() &&
+                       !pending_readbacks.FrontReady([this](u64 tick) { return scheduler.IsFreePolled(tick); });
+            }
+            if (idle) {
+                CACHE_STAT(eop_skips, 1);
+                return;
+            }
+        }
+        CACHE_STAT(eop_waits, 1);
         // Upload workers must finish reading RAM before these pages become inaccessible.
-        scheduler.WaitHostCopies();
+        // gow3 W2 (on by default since T-E1; GOW3_EOP_TARGETED=0 or toggle bit 60 live: off): only the copies that
+        // read the memory this end of pipe writes or protects: the queued readbacks (retired
+        // into guest memory) and the images about to be downloaded (watched from now on).
+        // Usually none: the full wait was ~21% of the draw recording thread (T-P3). The ranges
+        // are collected under the locks and waited for without them: a copy thread faulting on
+        // a watched page resolves readbacks under readback_mutex.
+        static const bool targeted = [] {
+            const char* env = std::getenv("GOW3_EOP_TARGETED");
+            return !env || env[0] != '0';
+        }();
+        if (targeted && !Gow3Toggle::Disabled(Gow3Toggle::IdleEopSkip)) {
+            boost::container::small_vector<std::pair<VAddr, u64>, 16> ranges;
+            {
+                std::scoped_lock readback_lock{readback_mutex};
+                std::unique_lock lock{download_images_mutex};
+                pending_readbacks.ForEach(
+                    [&](u64 address, u64 size) { ranges.emplace_back(address, size); });
+                for (const ImageId image_id : download_images) {
+                    const auto& info = slot_images[image_id].info;
+                    ranges.emplace_back(info.guest_address, info.guest_size);
+                }
+            }
+            for (const auto& [address, size] : ranges) {
+                scheduler.WaitHostCopiesFor(address, size);
+            }
+        } else {
+            scheduler.WaitHostCopies();
+        }
         std::scoped_lock readback_lock{readback_mutex};
-        RetireReadbacks();
+        RetireReadbacks(true); // the end-of-pipe poll (C1)
         std::unique_lock lock{download_images_mutex};
         for (const ImageId image_id : download_images) {
             const auto& image = slot_images[image_id];
@@ -185,9 +513,33 @@ void TextureCache::ProcessDownloadImages() {
                     copy->staging.Invalidate();
                     Core::Memory::Instance()->TryWriteBacking(
                         std::bit_cast<u8*>(copy->guest_address), copy->staging.mapped, copy->size);
+                    if (const u64 seq = NoteTrackedPush(copy->guest_address, copy->size)) {
+                        NoteTrackedPublish(copy->guest_address, copy->size, seq);
+                    }
+                    readback_published.insert(copy->guest_address);
                     runtime.GetStagingPool().FreeDeferred(copy->staging);
                 } else {
-                    WatchReadback<true>(copy->guest_address, copy->size);
+                    // gow3: a first copy (nothing published at this range yet) in stale mode:
+                    // logged, and with GOW3_READBACK_FIRST_WAIT its pages watch CPU reads too.
+                    const bool first = stale_readbacks &&
+                                       !readback_published.contains(copy->guest_address);
+                    const bool reads = first && readback_first_wait;
+                    if (reads) {
+                        tracker.UpdatePageWatchers<true, true>(copy->guest_address, copy->size);
+                    } else {
+                        WatchReadback<true>(copy->guest_address, copy->size);
+                    }
+                    if (first && readback_log) {
+                        std::printf("Readback first copy queued: %#llx (%llu bytes), image %ux%u "
+                                    "%u bits %s, tick %llu; CPU reads %s\n",
+                                    static_cast<unsigned long long>(copy->guest_address),
+                                    static_cast<unsigned long long>(copy->size),
+                                    image.info.size.width, image.info.size.height,
+                                    image.info.num_bits,
+                                    vk::to_string(image.info.pixel_format).c_str(),
+                                    static_cast<unsigned long long>(scheduler.CurrentTick()),
+                                    reads ? "wait for it" : "see the old bytes (stale mode)");
+                    }
                     if (Vulkan::WaitDiagnostics::Enabled()) {
                         // Which images go back to RAM each frame (the report lists the busiest).
                         auto* slot = std::ranges::find(readback_images, image.info.guest_address,
@@ -202,9 +554,12 @@ void TextureCache::ProcessDownloadImages() {
                         }
                     }
                     pending_readbacks.Push(copy->guest_address, copy->size,
-                        scheduler.CurrentTick(), copy->staging);
+                        scheduler.CurrentTick(), copy->staging,
+                        NoteTrackedPush(copy->guest_address, copy->size), reads);
+                    PublishReadbackSpans(); // C5: before any pre-check may skip the lock
                     has_pending_readbacks.store(true, std::memory_order_release);
                     ++readbacks_queued;
+                    readback_submit_wanted = !stale_readbacks;
                     readbacks_peak_bytes = std::max(readbacks_peak_bytes, pending_readbacks.Bytes());
                 }
             }
@@ -266,6 +621,58 @@ std::optional<TextureCache::PendingDownload> TextureCache::RecordImageDownload(I
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return std::nullopt;
     }
+    if (image.info.props.is_tiled && tiny_target_readback && IsTinyTarget(image.info)) {
+        // gow3: in the guest's tiled layout (the tiling shader writes the whole guest range,
+        // every mip), so a CPU read of the target finds each texel where the game looks for it.
+        boost::container::small_vector<vk::BufferImageCopy, 16> copies;
+        for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
+            const auto& mip_info = image.info.mips_layout[mip];
+            copies.push_back(vk::BufferImageCopy{
+                .bufferOffset = mip_info.offset,
+                .bufferRowLength = mip_info.pitch,
+                .bufferImageHeight = mip_info.height,
+                .imageSubresource{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .mipLevel = mip,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {std::max(image.info.size.width >> mip, 1u),
+                                std::max(image.info.size.height >> mip, 1u),
+                                std::max(image.info.size.depth >> mip, 1u)},
+            });
+        }
+        const auto download = runtime.GetStagingPool().Request(
+            image.info.guest_size, MemoryType::HostCached, 256, true);
+        tile_manager.TileImage(image, copies, download.buffer, download.offset);
+        if (readback_log && !readback_published.contains(image.info.guest_address)) {
+            // gow3 GOW3_READBACK_LOG: the first copy's texels as the GPU holds them (linear, mip
+            // 0, layer 0), to compare with where the tiled copy puts them.
+            const u64 linear_size =
+                u64{image.info.size.width} * image.info.size.height * (image.info.num_bits / 8);
+            const auto linear =
+                runtime.GetStagingPool().Request(linear_size, MemoryType::HostCached, 16, true);
+            vk::BufferImageCopy copy = copies[0];
+            copy.bufferOffset = linear.offset;
+            copy.bufferRowLength = image.info.size.width;
+            copy.bufferImageHeight = image.info.size.height;
+            copy.imageSubresource.layerCount = 1;
+            copy.imageExtent.depth = 1;
+            runtime.DownloadImage(&image, linear.buffer, std::span{&copy, 1});
+            scheduler.DeferPriorityOperation([this, linear, linear_size,
+                                              address = image.info.guest_address,
+                                              width = image.info.size.width,
+                                              height = image.info.size.height] {
+                linear.Invalidate();
+                std::printf("Readback first copy GPU texels (linear): %#llx %ux%u:%s\n",
+                            static_cast<unsigned long long>(address), width, height,
+                            NonZeroTexels(linear.mapped, linear_size, 16).c_str());
+                runtime.GetStagingPool().FreeDeferred(linear);
+            });
+        }
+        return PendingDownload{image.info.guest_address, image.info.guest_size, download};
+    }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
@@ -288,6 +695,90 @@ std::optional<TextureCache::PendingDownload> TextureCache::RecordImageDownload(I
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
     return PendingDownload{image.info.guest_address, download_size, download};
+}
+
+void TextureCache::LogTexelStats(Image& image) {
+    const auto& info = image.info;
+    const auto format = info.pixel_format;
+    const bool half = format == vk::Format::eR16G16B16A16Sfloat ||
+                      format == vk::Format::eR16G16Sfloat || format == vk::Format::eR16Sfloat;
+    const bool single = format == vk::Format::eR32G32B32A32Sfloat ||
+                        format == vk::Format::eR32G32Sfloat || format == vk::Format::eR32Sfloat;
+    if ((!half && !single) || info.props.is_depth || info.size.width > 256 ||
+        info.size.height > 256 || info.size.depth != 1) {
+        return;
+    }
+    static std::unordered_set<u64> seen; // GPU thread only
+    if (!seen.insert(info.guest_address ^ (u64(format) << 56) ^ (u64{info.size.width} << 40))
+             .second) {
+        return;
+    }
+    const u32 texel_bytes = info.num_bits / 8;
+    const u32 layers = info.resources.layers, levels = info.resources.levels;
+    boost::container::small_vector<vk::BufferImageCopy, 16> copies;
+    std::array<u64, 16> offsets{};
+    u64 total = 0;
+    for (u32 mip = 0; mip < levels && mip < 16; ++mip) {
+        const u32 w = std::max(info.size.width >> mip, 1u), h = std::max(info.size.height >> mip, 1u);
+        offsets[mip] = total;
+        copies.push_back(vk::BufferImageCopy{
+            .bufferOffset = total,
+            .bufferRowLength = w,
+            .bufferImageHeight = h,
+            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                              .mipLevel = mip,
+                              .baseArrayLayer = 0,
+                              .layerCount = layers},
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {w, h, 1},
+        });
+        total += u64{w} * h * layers * texel_bytes;
+    }
+    const auto staging = runtime.GetStagingPool().Request(total, MemoryType::HostCached, 16, true);
+    for (auto& copy : copies) {
+        copy.bufferOffset += staging.offset;
+    }
+    runtime.DownloadImage(&image, staging.buffer, copies);
+    scheduler.DeferPriorityOperation([this, staging, offsets, half, layers, texel_bytes,
+                                      levels = u32(copies.size()), address = info.guest_address,
+                                      width = info.size.width, height = info.size.height,
+                                      name = vk::to_string(format)] {
+        staging.Invalidate();
+        const u32 components = texel_bytes / (half ? 2 : 4);
+        for (u32 mip = 0; mip < levels; ++mip) {
+            const u32 w = std::max(width >> mip, 1u), h = std::max(height >> mip, 1u);
+            const u64 count = u64{w} * h * layers * components;
+            u64 nans = 0, infs = 0, nonzero = 0;
+            float lo = std::numeric_limits<float>::infinity(), hi = -lo;
+            const u8* base = staging.mapped + offsets[mip];
+            for (u64 i = 0; i < count; ++i) {
+                float v;
+                if (half) {
+                    u16 h16;
+                    std::memcpy(&h16, base + i * 2, 2);
+                    v = HalfToFloat(h16);
+                } else {
+                    std::memcpy(&v, base + i * 4, 4);
+                }
+                if (std::isnan(v)) {
+                    ++nans;
+                } else if (std::isinf(v)) {
+                    ++infs;
+                } else {
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                    nonzero += v != 0.0f;
+                }
+            }
+            std::printf("Texel stats %#llx %ux%u x%u %s mip %u: %llu values, NaN %llu, inf %llu, "
+                        "non-zero %llu, finite range %g .. %g\n",
+                        static_cast<unsigned long long>(address), width, height, layers,
+                        name.c_str(), mip, static_cast<unsigned long long>(count),
+                        static_cast<unsigned long long>(nans), static_cast<unsigned long long>(infs),
+                        static_cast<unsigned long long>(nonzero), lo, hi);
+        }
+        runtime.GetStagingPool().FreeDeferred(staging);
+    });
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
@@ -362,6 +853,7 @@ void TextureCache::ForEachAlias(const Image& image, Func&& func) {
 }
 
 void TextureCache::SynchronizeAlias(ImageId image_id) {
+    CACHE_STAT(alias_syncs, 1);
     Image& dst = slot_images[image_id];
     if (False(dst.flags & ImageFlagBits::Aliased)) {
         return;
@@ -422,6 +914,7 @@ bool TextureCache::CommitAliasWriter(AliasState& state) {
 }
 
 void TextureCache::CopyAlias(ImageId src_id, ImageId dst_id, const Extent3D& extent) {
+    CACHE_STAT(alias_copies, 1);
     Image& dst = slot_images[dst_id];
     runtime.CopyAliasImage(&slot_images[src_id], &dst, {extent.width, extent.height, extent.depth});
     dst.flags |= ImageFlagBits::GpuModified;
@@ -466,6 +959,55 @@ void TextureCache::InvalidateAlias(Image& image) {
     }
 }
 
+namespace {
+struct ImageWatchSpec {
+    u32 width = 0, height = 0, min_layers = 0;
+    std::atomic<u32> lines{0};
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+};
+ImageWatchSpec& ImageWatch() {
+    static ImageWatchSpec spec;
+    static const bool parsed = [] {
+        const char* env = std::getenv("GOW3_IMAGE_WATCH");
+        if (env && std::sscanf(env, "%ux%u:%u", &spec.width, &spec.height, &spec.min_layers) >= 2) {
+            const char* lines = std::getenv("GOW3_IMAGE_WATCH_LINES");
+            spec.lines = lines && *lines ? u32(std::strtoul(lines, nullptr, 10)) : 4000;
+        }
+        return true;
+    }();
+    (void)parsed;
+    return spec;
+}
+} // namespace
+
+bool TextureCache::Watched(const ImageInfo& info) const {
+    const auto& spec = ImageWatch();
+    return spec.width != 0 && info.size.width == spec.width && info.size.height == spec.height &&
+           info.resources.layers >= spec.min_layers;
+}
+
+void TextureCache::WatchNote(const Image& image, const char* event, const std::string& detail) {
+    auto& spec = ImageWatch();
+    u32 left = spec.lines.load(std::memory_order_relaxed);
+    while (left && !spec.lines.compare_exchange_weak(left, left - 1, std::memory_order_relaxed)) {
+    }
+    if (!left) {
+        return;
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - spec.start).count();
+    const auto flags = image.flags;
+    std::printf("Image watch %.3f s: %#llx %ux%u L%u/%u %s%s [%s%s%s%s%s] tick %llu\n", seconds,
+                static_cast<unsigned long long>(image.info.guest_address), image.info.size.width,
+                image.info.size.height, image.info.resources.levels, image.info.resources.layers,
+                event, detail.c_str(), True(flags & ImageFlagBits::Undefined) ? " undefined" : "",
+                True(flags & ImageFlagBits::CpuDirty) ? " cpu-dirty" : "",
+                True(flags & ImageFlagBits::MaybeCpuDirty) ? " maybe-cpu-dirty" : "",
+                True(flags & ImageFlagBits::GpuDirty) ? " gpu-dirty" : "",
+                True(flags & ImageFlagBits::GpuModified) ? " gpu-modified" : "",
+                static_cast<unsigned long long>(scheduler.CurrentTick()));
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
     if (image.hash == 0) {
         // Initialize hash
@@ -489,6 +1031,10 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             InvalidateAlias(image);
             image.flags |= ImageFlagBits::CpuDirty;
             UntrackImage(image_id);
+            if (Watched(image.info)) {
+                WatchNote(image, "CPU dirty",
+                          std::format(" by a write at +{:#x} size {:#x}", addr - image_begin, size));
+            }
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
             // We should not mark it as dirty now. If it really was modified
@@ -504,6 +1050,9 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Image begins and ends on this page so it can not receive any more invalidations.
             // We will check it's hash later to see if it really was modified.
             MarkAsMaybeDirty(image_id, image);
+            if (Watched(image.info)) {
+                WatchNote(image, "maybe CPU dirty");
+            }
         }
     });
 }
@@ -512,15 +1061,34 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     // Partial buffer writes still need the image's untouched bytes in guest memory.
     ResolveReadbacks(address, max_size, true, ReadbackSource::GpuPartialWrite);
     std::scoped_lock lock{mutex};
+    // gow3 GOW3_GPU_WRITE_SUBRESOURCES=1 (plan-linux-deck.md "Mausoleum lighting"): a GPU write
+    // anywhere inside an image marks it too, not only one at its base address. UE4 copies each
+    // reflection capture into its slice of the capture array: those writes start inside the
+    // array, so the cached array kept what guest memory held when it was first sampled.
+    static const bool subresources = [] {
+        const char* env = std::getenv("GOW3_GPU_WRITE_SUBRESOURCES");
+        return env && env[0] == '1';
+    }();
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
         if (image.info.guest_address != address) {
-            return;
+            const bool inside = image.Overlaps(address, max_size);
+            if (inside && Watched(image.info)) {
+                WatchNote(image, subresources ? "GPU write inside" : "GPU write inside, ignored",
+                          std::format(" at +{:#x} size {:#x}", address - image.info.guest_address,
+                                      max_size));
+            }
+            if (!subresources || !inside) {
+                return;
+            }
         }
         // Ensure image is reuploaded when accessed again.
         InvalidateAlias(image);
         image.flags |= ImageFlagBits::GpuDirty;
+        if (Watched(image.info)) {
+            WatchNote(image, "GPU dirty", std::format(" by a GPU buffer write of {:#x}", max_size));
+        }
     });
 }
 
@@ -531,9 +1099,130 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
+        if (unmapped_addresses.size() > 16384) {
+            unmapped_addresses.clear();
+        }
+        unmapped_addresses.insert(slot_images[id].info.guest_address);
+        if (CacheStatsEnabled()) {
+            const ImageInfo& info = slot_images[id].info;
+            CACHE_STAT(unmap_frees, 1);
+            CACHE_STAT(unmap_free_bytes, info.guest_size);
+            unmapped_recently[RecreateKey(info)] = stats_reports;
+        }
+        if (Watched(slot_images[id].info)) {
+            WatchNote(slot_images[id], "unmapped",
+                      std::format(" (guest unmap at {:#x} size {:#x})", cpu_addr, size));
+        }
+        if (ParkImage(id)) {
+            continue;
+        }
         // TODO: Download image data back to host.
         FreeImage(id);
     }
+}
+
+namespace {
+bool ParkUnmappedEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GOW3_PARK_UNMAPPED");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+// Several 4K pairs and many shadow maps; a parked image is dropped after ParkedMaxAge.
+constexpr u64 ParkedBudget = 768_MB;
+constexpr u64 ParkedMaxImage = 128_MB;
+constexpr auto ParkedMaxAge = std::chrono::seconds(10);
+} // namespace
+
+bool TextureCache::ParkImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (!ParkUnmappedEnabled() || !(image.usage.render_target || image.usage.depth_target) ||
+        image.usage.vo_surface || image.scene_proxy || True(image.flags & ImageFlagBits::Aliased) ||
+        image.info.guest_size > ParkedMaxImage) {
+        return false;
+    }
+    // As FreeImage and DeleteImage, without releasing the image and its views.
+    ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
+                     ReadbackSource::ImageFree);
+    CancelReadbacks(image.info.guest_address, image.info.guest_size);
+    UntrackImage(image_id);
+    UnregisterImage(image_id);
+    const auto& meta_info = image.info.meta_info;
+    if (meta_info.cmask_addr) {
+        surface_metas.erase(meta_info.cmask_addr);
+    }
+    if (meta_info.fmask_addr) {
+        surface_metas.erase(meta_info.fmask_addr);
+    }
+    if (meta_info.htile_addr) {
+        surface_metas.erase(meta_info.htile_addr);
+    }
+    {
+        std::unique_lock lk{download_images_mutex};
+        download_images.erase(image_id);
+    }
+    parked_images.push_back({image_id, std::chrono::steady_clock::now()});
+    parked_bytes += image.info.guest_size;
+    parked_count.store(u32(parked_images.size()), std::memory_order_relaxed);
+    CACHE_STAT(parked, 1);
+    EvictParkedImages(true);
+    return true;
+}
+
+ImageId TextureCache::TakeParkedImage(const ImageInfo& info) {
+    for (auto it = parked_images.begin(); it != parked_images.end(); ++it) {
+        Image& image = slot_images[it->id];
+        const ImageInfo& parked = image.info;
+        if (parked.guest_address != info.guest_address || parked.guest_size != info.guest_size ||
+            parked.size != info.size || parked.pixel_format != info.pixel_format ||
+            parked.type != info.type || parked.tile_mode != info.tile_mode ||
+            parked.pitch != info.pitch || parked.resources != info.resources ||
+            parked.num_samples != info.num_samples || parked.num_bits != info.num_bits ||
+            parked.props.is_tiled != info.props.is_tiled ||
+            parked.props.is_depth != info.props.is_depth ||
+            parked.props.has_stencil != info.props.has_stencil ||
+            parked.props.is_block != info.props.is_block ||
+            parked.props.is_pow2 != info.props.is_pow2 ||
+            parked.props.is_volume != info.props.is_volume || parked.alt_tile != info.alt_tile) {
+            continue;
+        }
+        const ImageId image_id = it->id;
+        parked_bytes -= parked.guest_size;
+        parked_images.erase(it);
+        parked_count.store(u32(parked_images.size()), std::memory_order_relaxed);
+        // Back as a new image would start: dirty, not bound, no usage yet (the caller registers
+        // it and flags it Undefined as the unmap's address). Its layout state stays: it is the
+        // Vulkan image's.
+        image.flags = ImageFlagBits::Dirty;
+        image.binding = {};
+        image.usage = {};
+        image.depth_id = {};
+        image.depth_uid = 0;
+        image.info.meta_info = info.meta_info;
+        image.info.stencil_addr = info.stencil_addr;
+        image.info.stencil_size = info.stencil_size;
+        CACHE_STAT(parked_reused, 1);
+        return image_id;
+    }
+    return {};
+}
+
+void TextureCache::EvictParkedImages(bool over_budget_only) {
+    const auto now = std::chrono::steady_clock::now();
+    while (!parked_images.empty()) {
+        const ParkedImage& oldest = parked_images.front();
+        if (parked_bytes <= ParkedBudget &&
+            (over_budget_only || now - oldest.since < ParkedMaxAge)) {
+            break;
+        }
+        const ImageId image_id = oldest.id;
+        parked_bytes -= slot_images[image_id].info.guest_size;
+        parked_images.erase(parked_images.begin());
+        DeleteImage(image_id);
+        CACHE_STAT(parked_evicted, 1);
+    }
+    parked_count.store(u32(parked_images.size()), std::memory_order_relaxed);
 }
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
@@ -612,6 +1301,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            BindingType binding,
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
+    CACHE_STAT(overlaps, 1);
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
@@ -638,27 +1328,17 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
-        // gow3: a 3D image drawn as a 2D array of its slices (MediEvil: UE4's translucency
-        // lighting volumes and colour grading LUT, sampled as 3D) is served by the 3D image
-        // itself, created 2D array compatible, through a 2D array view. Expanding rebuilt and
-        // copied the image at every switch: ~14 image rebuilds per frame.
-        // GOW3_VOLUME_VIEWS=0: expand as before.
+        // gow3: MediEvil's colour grading LUT and translucency lighting volumes switched
+        // between a 2D array (render target) and a 3D image (texture) several times a frame,
+        // each switch a full re-upload from guest memory: about 2 GB/s over PCIe (T-C1). The
+        // 3D image serves the slices through a 2D array view (V3; upstream 1.3.4 has the same
+        // idea; its GOW3_VOLUME_VIEWS=0 also turns this off, as does toggle bit 58).
         static const bool volume_views = [] {
             const char* env = std::getenv("GOW3_VOLUME_VIEWS");
             return !env || env[0] != '0';
         }();
-        // Only with VK_EXT_image_2d_view_of_3d: without it a 2D view of a 3D image may only be a
-        // render target, and older drivers (AMD Polaris, issue #18) keep the old path.
-        if (volume_views && instance.Is2dViewOf3dSupported() &&
-            cache_image.info.type == AmdGpu::ImageType::Color3D &&
-            cache_image.info.props.is_volume && image_info.type != AmdGpu::ImageType::Color3D &&
-            image_info.guest_size == cache_image.info.guest_size &&
-            image_info.pixel_format == cache_image.info.pixel_format &&
-            image_info.tile_mode == cache_image.info.tile_mode &&
-            image_info.size.width == cache_image.info.size.width &&
-            image_info.size.height == cache_image.info.size.height &&
-            image_info.resources.layers == cache_image.info.size.depth &&
-            image_info.resources.levels == 1 && cache_image.info.resources.levels == 1) {
+        if (volume_views && IsVolumeSliceTarget(image_info, binding, cache_image.info)) {
+            CACHE_STAT(volume_views, 1);
             return {cache_image_id, -1, -1};
         }
 
@@ -821,10 +1501,13 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
     // Right overlap, the image requested is a possible subresource of the image from cache.
     if (image_info.guest_address > cache_image.info.guest_address) {
-        if (auto mip = image_info.MipOf(cache_image.info); mip >= 0) {
-            if (auto slice = image_info.SliceOf(cache_image.info, mip); slice >= 0) {
-                return {cache_image_id, mip, slice};
-            }
+        const auto mip = image_info.MipOf(cache_image.info);
+        const auto slice = mip >= 0 ? image_info.SliceOf(cache_image.info, mip) : -1;
+        if (binding == BindingType::RenderTarget || binding == BindingType::DepthTarget) {
+            NoteMipTarget(image_info, cache_image.info, mip, slice, false);
+        }
+        if (mip >= 0 && slice >= 0) {
+            return {cache_image_id, mip, slice};
         }
 
         // Image isn't a subresource but a chance overlap.
@@ -835,7 +1518,13 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         return {{}, -1, -1};
     } else {
         // Left overlap, the image from cache is a possible subresource of the image requested
-        if (auto mip = cache_image.info.MipOf(image_info); mip >= 0) {
+        const auto merge_mip = cache_image.info.MipOf(image_info);
+        if (cache_image.binding.is_target) {
+            NoteMipTarget(cache_image.info, image_info, merge_mip,
+                          merge_mip >= 0 ? cache_image.info.SliceOf(image_info, merge_mip) : -1,
+                          true);
+        }
+        if (auto mip = merge_mip; mip >= 0) {
             if (auto slice = cache_image.info.SliceOf(image_info, mip); slice >= 0) {
                 // We have a larger image created and a separate one, representing a subres of it
                 // bound as render target. In this case we need to rebind render target.
@@ -853,6 +1542,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 if (merged_image_id) {
                     auto& merged_image = slot_images[merged_image_id];
                     runtime.CopyMip(&cache_image, &merged_image, mip, slice);
+                    if (Watched(merged_image.info)) {
+                        WatchNote(merged_image, "mip merged in",
+                                  std::format(" (mip {} slice {} from a separate image)", mip, slice));
+                    }
                     FreeImage(cache_image_id);
                 }
             }
@@ -863,6 +1556,25 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+    CACHE_STAT(expands, 1);
+    if (CacheStatsEnabled()) {
+        // Which images are expanded, from what to what (the busiest are printed with the stats).
+        const ImageInfo& old = slot_images[image_id].info;
+        const char* why = info.props.is_block && !old.props.is_block ? "block view"
+                          : (info.type == AmdGpu::ImageType::Color3D) !=
+                                    (old.type == AmdGpu::ImageType::Color3D)
+                              ? "2D/3D"
+                              : "bigger";
+        char key[192];
+        std::snprintf(key, sizeof(key), "%#llx %s: %ux%ux%u t%d %s L%u/%u -> %ux%ux%u t%d %s L%u/%u, %llu KiB",
+                      (unsigned long long)info.guest_address, why, old.size.width, old.size.height,
+                      old.size.depth, int(old.type), vk::to_string(old.pixel_format).c_str(),
+                      old.resources.levels, old.resources.layers, info.size.width, info.size.height,
+                      info.size.depth, int(info.type), vk::to_string(info.pixel_format).c_str(),
+                      info.resources.levels, info.resources.layers,
+                      (unsigned long long)(info.guest_size >> 10));
+        ++expand_sites[key];
+    }
     if (image_stats) {
         static int logged = 0;
         if (logged < 12) {
@@ -885,6 +1597,11 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
     RefreshImage(new_image);
     runtime.CopyImage(&src_image, &new_image);
+    if (Watched(new_image.info)) {
+        WatchNote(new_image, "expanded",
+                  std::format(" (contents copied from the old image L{}/{})",
+                              src_image.info.resources.levels, src_image.info.resources.layers));
+    }
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -898,9 +1615,14 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
+    GOW3_SECTION(FindImage);
 
     scheduler.SyncWithDrawRecorder(); // before the lock: the draw recorder takes it too
-    std::scoped_lock lock{mutex};
+    std::unique_lock lock{mutex, std::defer_lock};
+    {
+        GOW3_SECTION(CacheLock);
+        lock.lock();
+    }
 
     u64 key_hash = info.guest_address ^ info.guest_size << 17 ^ u64(info.pixel_format) << 40 ^
                    u64(info.size.width) << 24 ^ info.size.height ^ u64(desc.type) << 58 ^
@@ -928,6 +1650,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         cached.exact_fmt == exact_fmt && cached.binding == desc.type &&
         cached.levels == info.resources.levels && cached.layers == info.resources.layers &&
         !Gow3Toggle::Disabled(Gow3Toggle::FindImageCache)) {
+        CACHE_STAT(fast_lookups, 1);
         Image& image = slot_images[cached.image_id];
         image.tick_accessed_last = scheduler.CurrentTick();
         TouchImage(image);
@@ -940,9 +1663,22 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         return cached.image_id;
     }
 
+    // Study 2026-10-29 item 10: a miss only because another image's registration changed the
+    // generation (the same key resolves to the same image again), counted below.
+    const bool same_key = Gow3Stats::enabled && cached.image_id && cached.address == info.guest_address &&
+                          cached.size == info.guest_size && cached.extent == info.size &&
+                          cached.format == info.pixel_format && cached.type == info.type &&
+                          cached.exact_fmt == exact_fmt && cached.binding == desc.type &&
+                          cached.levels == info.resources.levels &&
+                          cached.layers == info.resources.layers;
+    const FindImageCacheEntry previous = cached;
+
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    CACHE_STAT(slow_lookups, 1);
+    if (Gow3Stats::enabled) Gow3Stats::image_slow_lookups.fetch_add(1, std::memory_order_relaxed);
+    CACHE_STAT(slow_candidates, image_ids.size());
 
     ImageId image_id{};
 
@@ -993,13 +1729,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
         } else if (image_resolved.info.resources < info.resources &&
-                   !(instance.Is2dViewOf3dSupported() && image_resolved.info.props.is_volume &&
-                     image_resolved.info.type == AmdGpu::ImageType::Color3D &&
-                     info.type != AmdGpu::ImageType::Color3D &&
-                     info.resources.layers <= image_resolved.info.size.depth &&
-                     info.resources.levels <= image_resolved.info.resources.levels)) {
-            // The image was clearly picked up wrong. (gow3: a 3D image serving a 2D array of its
-            // slices, see ResolveOverlap, has them as depth, not as layers.)
+                   !IsVolumeSliceTarget(info, desc.type, image_resolved.info)) {
+            // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
@@ -1007,8 +1738,70 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
-        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        if (CacheStatsEnabled()) {
+            // Which images are created, and how many were freed by a guest unmap shortly before
+            // (MediEvil: hundreds per frame while panning, T-M1b).
+            if (const auto it = unmapped_recently.find(RecreateKey(info)); it != unmapped_recently.end()) {
+                CACHE_STAT(recreated, 1);
+                CACHE_STAT(recreated_bytes, info.guest_size);
+                unmapped_recently.erase(it);
+            }
+            static constexpr const char* bindings[] = {"texture", "storage", "render target",
+                                                       "depth target", "video out"};
+            char key[160];
+            std::snprintf(key, sizeof(key), "%ux%ux%u t%d %s L%u/%u %s %s, %llu KiB", info.size.width,
+                          info.size.height, info.size.depth, int(info.type),
+                          vk::to_string(info.pixel_format).c_str(), info.resources.levels,
+                          info.resources.layers, info.props.is_tiled ? "tiled" : "linear",
+                          bindings[u32(desc.type)], (unsigned long long)(info.guest_size >> 10));
+            ++create_sites[key];
+        }
+        if (parked_count.load(std::memory_order_relaxed)) {
+            image_id = TakeParkedImage(info);
+        }
+        if (!image_id) {
+            const auto start = std::chrono::steady_clock::now();
+            image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+            if (CacheStatsEnabled()) {
+                const u64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start).count();
+                create_ns += ns;
+                create_max_ns = std::max(create_max_ns, ns);
+            }
+        }
         RegisterImage(image_id);
+        if (Watched(slot_images[image_id].info)) {
+            static constexpr const char* bindings[] = {"texture", "storage", "render target",
+                                                       "depth target", "video out"};
+            const u32 b = u32(desc.type);
+            WatchNote(slot_images[image_id], "created",
+                      std::format(" for use as {}", b < 5 ? bindings[b] : "?"));
+        }
+        // gow3: UE4 takes render targets from pool memory it decommits while a pass is unused
+        // and commits again when it is needed (MediEvil: the first torch in view); the guest
+        // memory there holds nothing the GPU needs to load (T-R1: 64 + 32 MiB uploaded per torch
+        // coming into view, a 20 ms frame).
+        // gow3 GOW3_NEW_IMAGES_UNDEFINED (default on; 0: only the unmap / GPU-freed cases): every
+        // new image counts as undefined until its first use. A first use as a render / depth
+        // target then skips the upload (the GPU renders into it; nothing the CPU wrote there is
+        // read first); any other first use uploads as before (RefreshImage drops the flag), so
+        // textures the CPU loads are unchanged. t-up4: 4K targets in fresh pool memory (no image
+        // had been there) uploaded 32-64 MB each right before being rendered into.
+        static const bool new_undefined = [] {
+            const char* env = std::getenv("GOW3_NEW_IMAGES_UNDEFINED");
+            return !(env && env[0] == '0');
+        }();
+        // Also where a GPU-written image was freed (FreeImage: its memory never got the GPU's data).
+        const bool unmapped = unmapped_addresses.erase(info.guest_address) != 0;
+        const bool gpu_freed = gpu_freed_addresses.erase(info.guest_address) != 0;
+        if ((unmapped || gpu_freed || new_undefined) &&
+            !Gow3Toggle::Disabled(Gow3Toggle::UndefinedTargets)) {
+            slot_images[image_id].flags |= ImageFlagBits::Undefined;
+            if (!unmapped) {
+                CACHE_STAT(gpu_freed_reused, 1);
+                CACHE_STAT(gpu_freed_reused_bytes, info.guest_size);
+            }
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -1023,6 +1816,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         desc.view_info.range.base.layer = view_slice;
     }
 
+    if (same_key && previous.image_id == image_id && previous.view_mip == view_mip &&
+        previous.view_slice == view_slice) {
+        Gow3Stats::image_generation_misses.fetch_add(1, std::memory_order_relaxed);
+    }
     cached = FindImageCacheEntry{
         .address = info.guest_address,
         .size = info.guest_size,
@@ -1071,15 +1868,68 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+namespace {
+// gow3 (plan-linux-deck.md "Mausoleum lighting"): GOW3_SKIPPED_TARGET_LOG=1 logs, once per image,
+// each small render target or storage image (at most 64 KiB) the GPU writes but this cache never
+// copies back to guest memory (tiled and wider than 8 pixels), with the first bytes the CPU would
+// read there instead, as half floats: a CPU read of such a target sees those bytes.
+bool SkippedTargetLog() {
+    static const bool on = [] {
+        const char* env = std::getenv("GOW3_SKIPPED_TARGET_LOG");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+void LogSkippedTarget(const ImageInfo& info, const char* kind) {
+    if (info.guest_address == 0 || info.guest_size > 64_KB) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = info.guest_address ^ (u64{info.size.width} << 48) ^ (u64{info.size.height} << 32) ^
+                    u64(info.pixel_format);
+    {
+        std::scoped_lock lk{mutex};
+        if (!seen.insert(key).second) {
+            return;
+        }
+    }
+    std::array<u16, 16> words{};
+    const bool read = Core::Memory::Instance()->ReadBacking(info.guest_address, words.data(),
+                                                            sizeof(words));
+    std::string halves;
+    for (const u16 w : words) {
+        halves += std::format(" {:.6g}", HalfToFloat(w));
+    }
+    std::printf("Skipped target (%s, never copied back): %#llx %u bytes, %ux%u x%u, %s, %s; guest "
+                "bytes as halves:%s\n",
+                kind, static_cast<unsigned long long>(info.guest_address), info.guest_size,
+                info.size.width, info.size.height, info.resources.layers,
+                vk::to_string(info.pixel_format).c_str(),
+                std::string(AmdGpu::NameOf(info.tile_mode)).c_str(),
+                read ? halves.c_str() : " (unreadable)");
+}
+} // namespace
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, ViewMemo* memo,
                                      bool refresh) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
+        if (Watched(image.info)) {
+            const auto& range = desc.view_info.range;
+            WatchNote(image, "storage write", std::format(" mips {}+{} layers {}+{}", range.base.level,
+                                                          range.extent.levels, range.base.layer,
+                                                          range.extent.layers));
+        }
+        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8 ||
+                                       (tiny_target_readback && IsTinyTarget(image.info))) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
+        } else if (SkippedTargetLog()) {
+            LogSkippedTarget(image.info, "storage");
         }
     }
     if (refresh) {
@@ -1105,11 +1955,21 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+    if (Watched(slot_images[image_id].info)) {
+        const auto& range = desc.view_info.range;
+        WatchNote(slot_images[image_id], "render target", std::format(
+            " mips {}+{} layers {}+{}", range.base.level, range.extent.levels, range.base.layer,
+            range.extent.layers));
+    }
+    DiscardUndefinedContents(image_id);
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8 ||
+                                   (tiny_target_readback && IsTinyTarget(image.info)))) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
+    } else if (SkippedTargetLog()) {
+        LogSkippedTarget(image.info, "render target");
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
@@ -1132,6 +1992,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 }
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
+    DiscardUndefinedContents(image_id);
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
@@ -1179,9 +2040,73 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
-void TextureCache::RefreshImage(Image& image) {
+void TextureCache::DiscardUndefinedContents(ImageId image_id) {
+    // Without `mutex`: some callers of FindRenderTarget / FindDepthTarget hold it (std::mutex).
+    // The flags are changed atomically, as UpdateImage's fast path reads them.
+    Image& image = slot_images[image_id];
+    std::atomic_ref<u32> flags{reinterpret_cast<u32&>(image.flags)};
+    constexpr u32 Undefined = static_cast<u32>(ImageFlagBits::Undefined);
+    constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
+    if (flags.load(std::memory_order_acquire) & Undefined &&
+        flags.fetch_and(~(Undefined | Dirty), std::memory_order_acq_rel) & Undefined) {
+        CACHE_STAT(undefined_targets, 1);
+        CACHE_STAT(undefined_target_bytes, image.info.guest_size);
+    }
+}
+
+void TextureCache::DiscardClearedContents(ImageId image_id) {
+    // Same locking as DiscardUndefinedContents.
+    Image& image = slot_images[image_id];
+    std::atomic_ref<u32> flags{reinterpret_cast<u32&>(image.flags)};
+    constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
+    if (flags.load(std::memory_order_acquire) & Dirty &&
+        flags.fetch_and(~Dirty, std::memory_order_acq_rel) & Dirty) {
+        CACHE_STAT(cleared_targets, 1);
+        CACHE_STAT(cleared_target_bytes, image.info.guest_size);
+    }
+}
+
+void TextureCache::RefreshImage(Image& image, std::source_location caller) {
+    // A first use other than as a render / depth target: the contents count from here.
+    const bool was_undefined = True(image.flags & ImageFlagBits::Undefined);
+    image.flags &= ~ImageFlagBits::Undefined;
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
+    }
+    if (Watched(image.info)) {
+        std::string_view file{caller.file_name()};
+        file = file.substr(file.find_last_of("/\\") + 1);
+        WatchNote(image, "uploaded from guest memory",
+                  std::format(" ({:#x} bytes{}, from {}:{})", image.info.guest_size,
+                              was_undefined ? ", was undefined" : "", file, caller.line()));
+    }
+    CACHE_STAT(refreshes, 1);
+    CACHE_STAT(refresh_bytes, image.info.guest_size);
+    if (CacheStatsEnabled()) {
+        // Which images are uploaded again and why (MediEvil: ~100 MB in one frame when a torch
+        // comes into view, for 3 new images).
+        const ImageInfo& info = image.info;
+        const char* why = True(image.flags & ImageFlagBits::CpuDirty)        ? "CPU dirty"
+                          : True(image.flags & ImageFlagBits::GpuDirty)      ? "GPU dirty (buffer)"
+                          : True(image.flags & ImageFlagBits::MaybeCpuDirty) ? "maybe CPU dirty"
+                                                                             : "?";
+        // Also: an image made where an unmap freed images (C3: its memory is undefined), and the
+        // caller of this first use (sampled, storage, copy, ...).
+        std::string_view file{caller.file_name()};
+        file = file.substr(file.find_last_of("/\\") + 1);
+        char key[300];
+        std::snprintf(key, sizeof(key), "%#llx %ux%ux%u %s L%u/%u%s%s%s, %s%s%s, from %.*s:%u",
+                      (unsigned long long)info.guest_address, info.size.width, info.size.height,
+                      info.size.depth, vk::to_string(info.pixel_format).c_str(), info.resources.levels,
+                      info.resources.layers, image.usage.render_target ? " RT" : "",
+                      image.usage.depth_target ? " depth" : "", image.usage.texture ? " tex" : "", why,
+                      True(image.flags & ImageFlagBits::GpuModified) ? ", GPU modified" : "",
+                      was_undefined ? ", undefined (unmap-freed)" : "", int(file.size()), file.data(),
+                      caller.line());
+        std::scoped_lock lock{refresh_sites_mutex};
+        auto& site = refresh_sites[key];
+        ++site.first;
+        site.second += info.guest_size;
     }
     ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                      ReadbackSource::ImageRefresh);
@@ -1329,6 +2254,7 @@ void TextureCache::NoteImageChurn(bool registered, u32 line, const ImageInfo& in
 
 void TextureCache::RegisterImage(ImageId image_id) {
     Gow3Stats::images_registered.fetch_add(1, std::memory_order_relaxed);
+    CACHE_STAT(registered, 1);
     Image& image = slot_images[image_id];
     if (image_stats) {
         NoteImageChurn(true, 0, image.info);
@@ -1336,6 +2262,11 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    // Region stamps first, then the generation: a memo lookup (BindTexturesFromSetIn) reads the
+    // generation, then the stamps, and confirms a set at the generation it read. Bumped the other
+    // way round, a lookup between the two could confirm a set at the new generation with the old
+    // stamps, and later lookups at that generation skip the stamp check.
+    BumpRegions(image.info.guest_address, image.info.guest_size);
     ++registry_generation;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
@@ -1367,10 +2298,12 @@ void TextureCache::RegisterImage(ImageId image_id) {
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
+    CACHE_STAT(unregistered, 1);
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    BumpRegions(image.info.guest_address, image.info.guest_size); // before the generation (RegisterImage)
     ++registry_generation;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
@@ -1663,8 +2596,99 @@ void TextureCache::RunGarbageCollector() {
         ++gc_tick;
     };
 
+    if (parked_count.load(std::memory_order_relaxed)) {
+        std::scoped_lock lock{mutex};
+        EvictParkedImages(false);
+    }
     GarbageCollectImages();
     GarbageCollectSamplers();
+    if (CacheStatsEnabled()) {
+        static auto last = std::chrono::steady_clock::now();
+        static u64 live_registered = 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last >= std::chrono::seconds(5)) {
+            last = now;
+            const auto take = [](std::atomic<u64>& v) { return v.exchange(0, std::memory_order_relaxed); };
+            const u64 reg = take(cache_stats.registered), unreg = take(cache_stats.unregistered);
+            live_registered += reg - unreg;
+            const u64 slow = take(cache_stats.slow_lookups), candidates = take(cache_stats.slow_candidates);
+            std::printf("Texture cache stats (5 s): %llu images registered (+%llu -%llu), %zu slots, "
+                        "%zu alias groups; lookups fast %llu slow %llu (avg %.1f candidates); "
+                        "overlaps %llu, expands %llu; uploads %llu (%.1f MiB); alias syncs %llu, "
+                        "copies %llu, volume views %llu; GPU memory %llu MiB, collector trigger %llu / pressure %llu MiB, "
+                        "tick %llu\n",
+                        (unsigned long long)live_registered, (unsigned long long)reg,
+                        (unsigned long long)unreg, slot_images.size(), alias_states.size(),
+                        (unsigned long long)take(cache_stats.fast_lookups), (unsigned long long)slow,
+                        slow ? double(candidates) / slow : 0.0,
+                        (unsigned long long)take(cache_stats.overlaps),
+                        (unsigned long long)take(cache_stats.expands),
+                        (unsigned long long)take(cache_stats.refreshes),
+                        take(cache_stats.refresh_bytes) / 1048576.0,
+                        (unsigned long long)take(cache_stats.alias_syncs),
+                        (unsigned long long)take(cache_stats.alias_copies),
+                        (unsigned long long)take(cache_stats.volume_views),
+                        (unsigned long long)(total_used_memory >> 20),
+                        (unsigned long long)(trigger_gc_memory >> 20),
+                        (unsigned long long)(pressure_gc_memory >> 20), (unsigned long long)gc_tick);
+            std::scoped_lock lock{mutex};
+            std::vector<std::pair<u64, std::string>> top;
+            for (const auto& [key, count] : expand_sites) top.emplace_back(count, key);
+            std::sort(top.begin(), top.end(), std::greater<>{});
+            for (size_t i = 0; i < top.size() && i < 8; ++i) {
+                std::printf("  expand %6llu x  %s\n", (unsigned long long)top[i].first, top[i].second.c_str());
+            }
+            expand_sites.clear();
+            const u64 frees = take(cache_stats.unmap_frees), free_bytes = take(cache_stats.unmap_free_bytes),
+                      recreated = take(cache_stats.recreated), recreated_bytes = take(cache_stats.recreated_bytes);
+            std::printf("  freed by guest unmaps %llu (%.1f MiB); created again within ~30 s %llu (%.1f MiB)\n",
+                        (unsigned long long)frees, free_bytes / 1048576.0, (unsigned long long)recreated,
+                        recreated_bytes / 1048576.0);
+            const u64 undefined = take(cache_stats.undefined_targets),
+                      undefined_bytes = take(cache_stats.undefined_target_bytes);
+            std::printf("  targets made where an unmap freed images, not uploaded first: %llu (%.1f MiB)\n",
+                        (unsigned long long)undefined, undefined_bytes / 1048576.0);
+            const u64 cleared = take(cache_stats.cleared_targets),
+                      cleared_bytes = take(cache_stats.cleared_target_bytes);
+            std::printf("  dirty targets cleared by their pass, not uploaded first: %llu (%.1f MiB)\n",
+                        (unsigned long long)cleared, cleared_bytes / 1048576.0);
+            const u64 reused = take(cache_stats.gpu_freed_reused),
+                      reused_bytes = take(cache_stats.gpu_freed_reused_bytes);
+            std::printf("  other new images flagged undefined (GPU-freed or new): %llu (%.1f MiB)\n",
+                        (unsigned long long)reused, reused_bytes / 1048576.0);
+            // (under mutex, taken above)
+            std::printf("  unmapped targets parked %llu, taken back %llu, evicted %llu (now %zu, "
+                        "%.1f MiB); new images made in %.2f ms, max %.3f ms\n",
+                        (unsigned long long)take(cache_stats.parked),
+                        (unsigned long long)take(cache_stats.parked_reused),
+                        (unsigned long long)take(cache_stats.parked_evicted), parked_images.size(),
+                        parked_bytes / 1048576.0, create_ns / 1e6, create_max_ns / 1e6);
+            create_ns = create_max_ns = 0;
+            std::printf("  end of pipe with readback work (host copy wait) %llu, without (skipped) %llu\n",
+                        (unsigned long long)take(cache_stats.eop_waits),
+                        (unsigned long long)take(cache_stats.eop_skips));
+            top.clear();
+            for (const auto& [key, count] : create_sites) top.emplace_back(count, key);
+            std::sort(top.begin(), top.end(), std::greater<>{});
+            for (size_t i = 0; i < top.size() && i < 8; ++i) {
+                std::printf("  create %6llu x  %s\n", (unsigned long long)top[i].first, top[i].second.c_str());
+            }
+            create_sites.clear();
+            {
+                std::scoped_lock refresh_lock{refresh_sites_mutex};
+                std::vector<std::tuple<u64, u64, std::string>> refreshed;
+                for (const auto& [key, site] : refresh_sites) refreshed.emplace_back(site.second, site.first, key);
+                std::sort(refreshed.begin(), refreshed.end(), std::greater<>{});
+                for (size_t i = 0; i < refreshed.size() && i < 8; ++i) {
+                    std::printf("  refresh %5llu x %8.1f MiB  %s\n", (unsigned long long)std::get<1>(refreshed[i]),
+                                std::get<0>(refreshed[i]) / 1048576.0, std::get<2>(refreshed[i]).c_str());
+                }
+                refresh_sites.clear();
+            }
+            ++stats_reports;
+            std::erase_if(unmapped_recently, [&](const auto& entry) { return stats_reports - entry.second > 6; });
+        }
+    }
 }
 
 void TextureCache::TouchImage(const Image& image) {

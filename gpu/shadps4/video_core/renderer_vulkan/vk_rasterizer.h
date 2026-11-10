@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -15,7 +18,15 @@
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/vk_ue4_frame_map.h"
+#include "video_core/renderer_vulkan/vk_ue4_motion.h"
+#include "video_core/renderer_vulkan/vk_ue4_dlss.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "gow3_draw_classes.h"
+#include "gow3_sections.h"
+#include "gow3_stage_a.h"
+#include "gow3_texset_table.h"
+#include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -46,6 +57,10 @@ public:
         return buffer_cache;
     }
 
+    /// gow3 U2: null unless GOW3_UE4_MOTION_VIEW is set.
+    [[nodiscard]] Ue4Motion* GetUe4Motion() noexcept {
+        return ue4_motion.get();
+    }
     [[nodiscard]] TemporalUpscaler& GetUpscaler() noexcept {
         return *upscaler;
     }
@@ -86,10 +101,36 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// gow3: a ZPASS_DONE event (an occlusion query's counters): true when real occlusion
+    /// queries take it (vk_occlusion.h, GOW3_OCCLUSION=1), in order with the draws; false: the
+    /// caller writes the synthetic counters as before.
+    bool OcclusionEvent(VAddr address, u32 pairs);
+
+    /// gow3: the recording thread, before it records a draw or dispatch: queued CPU writes go
+    /// into the GPU's copy (D2), and a submission occlusion queries want is made (O3).
+    void BeforeRecord() {
+        GOW3_SECTION(BeforeRecord);
+        buffer_cache.ProcessCpuWrites();
+        if (occlusion && occlusion->TakeSubmitWanted()) {
+            scheduler.Flush();
+            Gow3Stats::occlusion_submits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /// gow3: a guest libc write into memory a shader wrote (BufferCache::PreciseCpuWrite); false:
+    /// the caller writes it normally (and faults).
+    bool PreciseCpuWrite(VAddr addr, const void* src, int value, u64 size);
     /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
-    void WaitHostCopies() {
+    void WaitHostCopies(std::source_location caller = std::source_location::current()) {
         DrainDrawPipe();
-        scheduler.WaitHostCopies();
+        scheduler.WaitHostCopies(caller);
+    }
+    /// Before a write into [address, address + size): waits only when a host copy may still read
+    /// it (Scheduler::WaitHostCopiesFor; toggle bit 62: always, as before).
+    void WaitHostCopiesFor(VAddr address, u64 size,
+                           std::source_location caller = std::source_location::current()) {
+        DrainDrawPipe();
+        scheduler.WaitHostCopiesFor(address, size, caller);
     }
 
     /// gow3: GPU command thread: waits until the draw recording thread has recorded every
@@ -126,9 +167,34 @@ public:
         scheduler.WaitDeferredSignals();
     }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
-    void SignalAfterHostCopies(std::function<void()> signal) {
-        scheduler.SignalAfterHostCopies(std::move(signal));
+    /// `urgent` false: a polled label (Scheduler::SignalAfterHostCopies).
+    void SignalAfterHostCopies(std::function<void()> signal, bool urgent = true) {
+        scheduler.SignalAfterHostCopies(std::move(signal), urgent);
     }
+    /// gow3 GOW3_GPU_FENCES (vk_gpu_signals.cpp; Bloodborne 0.7's SignalAfterGpu, 0fc2921
+    /// gpu/render/raster_signals.cpp): runs `signal` on the gow3:GpuSignals thread once the GPU
+    /// has executed the work recorded before this call, in call order. Called by the thread
+    /// recording: stage B, or stage A (which drains stage B first). `label`/`value`: the label it
+    /// writes (0: none), met in stream order for WAIT_REG_MEM (PendingSignalValue). `urgent`: the
+    /// guest may wait for it, so its submission is not left for later (HasUnsubmittedSignals).
+    void SignalAfterGpu(std::function<void()> signal, VAddr label = 0, u64 value = 0,
+                        bool urgent = true);
+    /// The newest label value handed to the signal thread and not written yet for `address`.
+    bool PendingSignalValue(VAddr address, u64& value);
+    /// An urgent signal waits for work not handed to the GPU yet (a Flush() would submit it).
+    [[nodiscard]] bool HasUnsubmittedSignals() const {
+        return newest_urgent_tick.load(std::memory_order_acquire) >= scheduler.CurrentTick();
+    }
+    /// Signals handed to the signal thread and not run yet.
+    [[nodiscard]] bool HasPendingSignals() const {
+        return pending_signals.load(std::memory_order_acquire) != 0;
+    }
+    /// Stage A, the end of a guest submission: submits for its signals when the GPU has run dry
+    /// or is on its last submission, else at most once per GOW3_SIGNAL_FLUSH_US (on stage B, in
+    /// order, when the draw pipe is in use).
+    void SubmitForSignals();
+    /// What the signal thread, the GPU and the draw pipe are at (watchdogs).
+    std::string DescribeSignals();
     /// The GPU command thread or the draw recording thread (fault handling runs inline there).
     bool IsGpuSideThread() const;
     bool IsGpuSideThreadId(u32 tid) const;
@@ -144,6 +210,14 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+    /// gow3 GOW3_ONSUBMIT_STAGE_B (impl-decode-pacing.md; default with GOW3_DECODE_PACING), stage
+    /// A at sceGnmSubmitDone: OnSubmit's work and the Flush after it run on stage B in stream
+    /// order instead of after a drain. False when the switch is off (the caller drains as
+    /// before); true when handed over or (no draw pipe) done here.
+    bool OnSubmitInOrder();
+    /// gow3 (stage A): ring copies of guest constants are not reused past this point (a new
+    /// guest command buffer, or a wait the CPU may write memory during).
+    void CloseRingReuse();
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -164,7 +238,12 @@ public:
 #endif
 
 private:
+    /// OnSubmit without its drain: fault buffer, image downloads, collectors, staging trim.
+    void OnSubmitWork();
     void PrepareRenderState(const GraphicsPipeline* pipeline);
+    /// gow3 N0 (GOW3_FRAME_STATS): the class and pixel shader of the draw whose targets
+    /// PrepareRenderState bound, into its scope (nothing when the scope is not timing).
+    void DrawClass(const GraphicsPipeline* pipeline, Gow3DrawClasses::Scope& scope);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     /// gow3: a draw continuing the open render pass with the same inputs gets the same render
@@ -264,23 +343,122 @@ private:
         const void* backing = nullptr;
         VideoCore::SubresourceRange range;
         bool proxy = false; ///< sampled from the scene proxy (view: SampleProxy on each use)
+        VAddr address = 0, sharp_address = 0; ///< the bound image's guest range and the T#'s
+        u64 size = 0, sharp_size = 0;
+        bool depth_aspect = false; ///< the view samples the depth aspect (SampleDepthInPlace)
     };
     struct TextureSet {
         u64 key = 0;
         const Shader::Info* stage = nullptr;
         u64 generation = ~0ull;
+        u64 stamp = 0; ///< region stamps of its entries (TextureCache::RegionStamp)
+        u64 last_use = 0; ///< two-way replacement
         u64 scene_generation = 0; ///< SceneTargets::Generation of the proxy views
         u32 count = 0;
         static constexpr u32 MaxImages = 16; ///< larger sets are not memoized
         std::array<u64, MaxImages> hashes{};
         std::array<TextureSetEntry, MaxImages> entries{};
     };
-    std::array<TextureSet, 32768> texture_sets{};
+    /// The table as before (second toggle word 2048): made on its first use.
+    std::unique_ptr<std::array<TextureSet, Gow3TexSet::Slots>> texture_sets;
+    /// gow3 T2 (impl-stage-b-per-draw-2.md; GOW3_TEXSET_WIDE=1, second toggle word 262144 off):
+    /// sets of 17-32 images ("over 16 images": ~54 binds a heavy Deck frame at ~7 us each), kept
+    /// as the table above keeps its sets, in slots of their own (two-way; made on first use).
+    struct WideTextureSet {
+        u64 key = 0;
+        const Shader::Info* stage = nullptr;
+        u64 generation = ~0ull;
+        u64 stamp = 0;
+        u64 last_use = 0;
+        u64 scene_generation = 0;
+        u32 count = 0;
+        static constexpr u32 MaxImages = 32;
+        static constexpr u32 Slots = 1024;
+        std::array<u64, MaxImages> hashes{};
+        std::array<TextureSetEntry, MaxImages> entries{};
+    };
+    std::unique_ptr<std::array<WideTextureSet, WideTextureSet::Slots>> wide_texture_sets;
+    /// The slow path's resolved images for the slot it fills (the first `count` are reset when
+    /// it has one; the others are never read).
+    std::array<TextureSetEntry, WideTextureSet::MaxImages> texture_set_resolved{};
+    /// gow3 (impl-texset-index.md): the same memo in a compact layout (default). The same slots,
+    /// keys and replacement (Gow3TexSet::Choose); per slot a 64-byte index entry (the two ways
+    /// of a key share 128 aligned bytes), the images a hit reads (48 bytes each), and apart what
+    /// only the region stamps read (32 bytes each): ~44 MB instead of ~52, a hit reading ~4
+    /// cache lines instead of ~9, in transparent huge pages where Linux allows them.
+    struct alignas(64) TextureSetHead {
+        u64 key = 0;
+        u64 last_use = 0;
+        u64 generation = ~0ull;
+        u64 stamp = 0;
+        u64 scene_generation = 0;
+        const Shader::Info* stage = nullptr;
+        u32 count = 0;
+    };
+    struct TextureSetHot {
+        u64 hash = 0; ///< the prepared T# hash (TextureSet::hashes)
+        vk::ImageView view;
+        const void* backing = nullptr;
+        VideoCore::SubresourceRange range;
+        VideoCore::ImageId id{};
+        bool proxy = false;
+        bool depth_aspect = false;
+    };
+    struct TextureSetCold {
+        VAddr address = 0, sharp_address = 0;
+        u64 size = 0, sharp_size = 0;
+    };
+    using TextureSetHotRow = std::array<TextureSetHot, TextureSet::MaxImages>;
+    using TextureSetColdRow = std::array<TextureSetCold, TextureSet::MaxImages>;
+    /// Heads, hot rows, cold rows (MakeCompactTextureSets, in the constructor).
+    std::unique_ptr<Gow3TexSet::TableMemory> texture_set_memory;
+    TextureSetHead* texture_set_heads = nullptr;
+    TextureSetHotRow* texture_set_hot = nullptr;
+    TextureSetColdRow* texture_set_cold = nullptr;
+    /// The slot BindTexturesFromSet chose for the slow path to fill, in either layout.
+    struct TextureSetSlot {
+        TextureSet* legacy = nullptr;
+        u32 compact = ~0u;
+        WideTextureSet* wide = nullptr; ///< T2: a set of 17-32 images
+        explicit operator bool() const {
+            return legacy || compact != ~0u || wide;
+        }
+    };
+    struct LegacyTextureSets;
+    struct CompactTextureSets;
+    struct WideTextureSets;
+    void MakeCompactTextureSets();
+    /// `hashes`: the stage's T# hashes (ImageDescHash), `count` of them.
+    template <class Table>
+    bool BindTexturesFromSetIn(const Table& table, const Shader::Info& stage, const u64* hashes,
+                               u32 count, u64 key, bool& barrier, TextureSetSlot& slot);
+    /// The slow path's resolved images into the slot (the set is kept), or the slot emptied.
+    void KeepTextureSet(const TextureSetSlot& slot, std::span<const TextureSetEntry> resolved);
+    void DropTextureSet(const TextureSetSlot& slot);
     u64 texture_set_hits = 0, texture_set_misses = 0;
+    u64 texture_set_tick = 0;
     std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new
+    /// Sets the slow path did not keep: storage, written, own colour / depth target, rebind,
+    /// incomplete, registry changed; and stages that cannot use the memo (study 2026-10-29 item 4).
+    std::array<u64, 8> texture_set_unkept{};
+    /// gow3 (study-stage-b-per-draw.md C3, GOW3_FRAME_STATS): BindTextures' slow path by cause
+    /// (TexslowCause) on the draw recording thread: calls and wall time (ns), bind helper apart.
+    enum TexslowCause : u32 {
+        TexslowCompute,     ///< a dispatch
+        TexslowUnprepared,  ///< a draw without a prepared draw (its sharps read at bind time)
+        TexslowWritten,     ///< a draw binding a written image or a mip-fallback binding
+        TexslowTooMany,     ///< more images than a memoized set holds
+        TexslowOther,       ///< memo off, frame capture, or no image
+        TexslowMemoMiss,    ///< memoizable, but no current set (first use, own target, changes)
+        TexslowCauses
+    };
+    std::array<u64, TexslowCauses> texslow_calls{}, texslow_ns{};
     /// Returns true when the stage's images were bound from the memo.
     bool BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
-                             u32 first_image_idx, bool& barrier, TextureSet*& slot);
+                             u32 first_image_idx, bool& barrier, TextureSetSlot& slot);
+    template <class Set>
+    u64 TextureSetStamp(const Set& set) const; ///< TextureSet or WideTextureSet
+    u64 TextureSetStamp(u32 compact_slot) const;
     /// The prepared sharps of `stage` in the current prepared draw, if they fit it.
     const PreparedStage* FindPreparedStage(const Shader::Info& stage) const;
     /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,
@@ -294,6 +472,10 @@ private:
 
     /// Display pass: counts the frame (Gow3Stats::gpu_frames) and, with GOW3_BUFFER_STATS, the lag.
     void NoteFrameStart();
+    /// gow3 U1 (GOW3_UE4_FRAME_MAP=1): the targets, sampled images and View buffer of this draw
+    /// or dispatch, for the UE4 frame map's log, and (U2) the UE4 motion vector pass at TAA.
+    /// Before BindResources. True: U3's DLSS replaced this TAA draw (skip it).
+    bool ObserveFrameMap(const Pipeline* pipeline);
     /// GOW3_GPU_PROFILE: a timestamp where a render pass starts (vk_gpu_profiler.h).
     void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state);
     void BindVertexBuffers(const GraphicsPipeline* pipeline,
@@ -335,6 +517,9 @@ private:
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
     std::unique_ptr<TemporalUpscaler> upscaler; // gow3: FSR (docs/upscaler.md)
+    std::unique_ptr<Ue4FrameMap> frame_map;     // gow3 U1: null unless GOW3_UE4_FRAME_MAP=1
+    std::unique_ptr<Ue4Motion> ue4_motion;      // gow3 U2: null unless GOW3_UE4_MOTION_VIEW or U3
+    std::unique_ptr<Ue4Dlss> ue4_dlss;          // gow3 U3: null unless GOW3_UE4_DLSS=1
     std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
     std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;
@@ -353,6 +538,17 @@ private:
         bool is_written;
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+    /// gow3: the separate stencil planes of bound depth buffers (address -> bytes), and those a
+    /// compute dispatch has rewritten since; the next bind copies them into the image (V1).
+    struct StencilPlaneWrite {
+        VAddr begin;
+        u64 size;
+        u64 shader;
+    };
+    std::unordered_map<VAddr, u64> stencil_planes;
+    std::unordered_map<VAddr, StencilPlaneWrite> stencil_plane_writes;
+    std::mutex stencil_plane_mutex;
+    void NoteStencilPlaneWrites(const Pipeline* pipeline);
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
@@ -490,6 +686,11 @@ private:
     std::vector<PendingWrite> pending_writes;
     VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
     u32 pending_checks = 0;
+    /// gow3 A2 (impl-stage-a-decode.md): the pages pending_writes covers, a filter in front of
+    /// PendingWriteOverlaps' scan (kept whatever the switch, so it can be switched on live).
+    Gow3StageA::PendingPages pending_pages;
+    /// GOW3_PENDING_FILTER=1 at start and second toggle word 2097152 clear.
+    static bool PendingFilterOn();
     u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
     float sampler_lod_bias = 0.0f; ///< gow3: extra bias of this draw's samplers
     bool scene_debug_frame = false; ///< GOW3_SCENE_DEBUG: this frame's passes are printed
@@ -517,9 +718,38 @@ private:
         return nullptr;
     }
     std::unique_ptr<ConstantRing> constant_ring;
+    /// gow3 GOW3_RING_REUSE (stage A): ring copies of guest constants within one guest command
+    /// buffer, by (address, size): a later draw binding the same range binds the copy.
+    struct RingReuse {
+        VAddr address;
+        u32 size;
+        u32 epoch;
+        u64 offset;
+    };
+    std::array<RingReuse, 4096> ring_reuse{};
+    u32 ring_reuse_epoch = 1;
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;
+    std::unique_ptr<OcclusionQueries> occlusion; ///< GOW3_OCCLUSION=1 (vk_occlusion.h)
+
+    /// gow3 GOW3_GPU_FENCES (vk_gpu_signals.cpp): signals waiting for the GPU, in tick order.
+    struct GpuSignal {
+        u64 tick;
+        std::function<void()> signal;
+        VAddr label;
+        u64 value;
+        u64 fence; ///< the fence lag probe's entry (Gow3FenceStats), ~0 if none
+    };
+    void GpuSignalLoop(std::stop_token token);
+    void GpuWatchdog(u64 tick);
+    void SubmitForSignalsNow();
+    std::mutex gpu_signals_mutex;
+    std::condition_variable_any gpu_signals_cv;
+    std::deque<GpuSignal> gpu_signals;
+    std::atomic<u64> newest_urgent_tick{0};
+    std::atomic<u64> pending_signals{0};
+    std::jthread gpu_signal_thread; ///< last: stopped first
 };
 
 } // namespace Vulkan

@@ -69,6 +69,34 @@ def run_script(name, *args, capture=False):
     return None
 
 
+# Prefixes extra-env.txt may set: the port's switches and the graphics stack's (driver, loader, SDL).
+EXTRA_ENV_PREFIXES = ('GOW3_', 'RADV_', 'MESA_', 'AMD_', 'VK_', 'SDL_')
+
+
+def load_extra_env(env, path):
+    """Test settings from <data>/extra-env.txt, one KEY=VALUE a line (# comments), applied on every
+    start however the game is launched (Steam, the launcher, --play); they override the environment.
+    Diagnostics without editing launch options; the log lists what was applied."""
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return
+    applied = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, sep, value = line.partition('=')
+        key = key.strip()
+        if not sep or not key.startswith(EXTRA_ENV_PREFIXES) or not key.replace('_', '').isalnum():
+            print(f'extra-env.txt: ignored "{line}" (KEY=VALUE, key starting with {", ".join(EXTRA_ENV_PREFIXES)})')
+            continue
+        env[key] = value.strip()
+        applied.append(f'{key}={env[key]}')
+    if applied:
+        print(f'Extra environment ({path}): {" ".join(applied)}')
+
+
 def find_executable(name):
     """bin/ (packaged), else out/ (built with build.sh)."""
     for candidate in (PORT / 'bin' / name, PORT / 'out' / name):
@@ -85,16 +113,25 @@ def main():
     # As run.sh: relative paths (GOW3_GAME_DIR, GOW3_DATA_DIR, fsr4_shaders/) are from the port.
     os.chdir(PORT)
     env = os.environ
+    # Values this script derived on the previous start ("Apply and restart" inherits them) are
+    # derived again from the new options. Dropped before extra-env.txt is read, so a test setting
+    # there is never dropped with them.
+    for key in env.pop('GOW3_DERIVED', '').split(','):
+        env.pop(key, None)
     data = Path(env.get('GOW3_DATA_DIR', PORT))
+    load_extra_env(env, data / 'extra-env.txt')
+    if env.get('GOW3_DECK_SWITCHES'):  # the launcher's Steam Deck performance switches (deck_switch_env)
+        print(f"Deck switches: {env['GOW3_DECK_SWITCHES']}", flush=True)
     out = data / 'out'
     out.mkdir(parents=True, exist_ok=True)
     if not (data / 'medievil.ini').exists() and (data / 'gow3.ini').exists():
         (data / 'gow3.ini').rename(data / 'medievil.ini')  # settings of builds before 1.1
     env.setdefault('GOW3_CONFIG', str(data / 'medievil.ini'))
-    # Values this script derived on the previous start ("Apply and restart" inherits them) are
-    # derived again from the new options.
-    for key in env.pop('GOW3_DERIVED', '').split(','):
-        env.pop(key, None)
+    # Everything set from here on is derived from the options (GOW3_DERIVED below), including the
+    # setdefault()s: the performance patches' off switches, the HZB / stream switches, the engine
+    # frame-rate and memory sizes. Before, only a listed few were, so after "Apply and restart" a
+    # patch turned back on in the menu stayed off (LANDMINES item 12).
+    given = set(env)
     derived = []
     sys.path.insert(0, str(PORT / 'scripts'))
     import graphics_options
@@ -102,6 +139,18 @@ def main():
     if reverted:
         print('Graphics: the last restart never reached the game; previous options restored', flush=True)
     env.update(graphics_options.environment(graphics))
+    ini_values = graphics_options.read_ini(env['GOW3_CONFIG'])
+    for key, value in graphics_options.perf_environment(ini_values).items():
+        env.setdefault(key, value)
+    # Presentation settings (launcher > Performance > Presentation); derived, so an in-game
+    # restart takes the new values.
+    trace = PORT / 'user' / 'logs' / 'flip-trace.csv'
+    for key, value in graphics_options.present_environment(ini_values, trace).items():
+        if key not in env:
+            env[key] = value
+            derived.append(key)
+    if 'GOW3_FLIP_TRACE' in derived:
+        trace.parent.mkdir(parents=True, exist_ok=True)
     if not env.get('GOW3_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['GOW3_FSR411_DIR'] = str(data / 'fsr4_411')
 
@@ -140,6 +189,8 @@ def main():
     if profile['name']:
         print(f'Game profile: {profile["name"]} ({", ".join(profile["modules"])})', flush=True)
     engine_fps = int(graphics['engine_fps'])
+    if graphics_options.no_frame_caps(ini_values):
+        engine_fps = 1000  # no engine bound (UE4 SmoothedFrameRateRange); the present limit is off too
     if profile.get('ue4_render_scale') and engine_fps > 60:
         # Unreal Engine 4 flips at every vblank (rhi.SyncInterval 1). A 480 Hz vblank with a frame
         # limit shows each frame when it is ready: a 120 Hz vblank turned 9 ms frames into 17 ms.
@@ -147,25 +198,26 @@ def main():
         env.setdefault('GOW3_FPS_CAP', str(engine_fps))
     if profile.get('ue4_render_scale'):
         import ue4_override
-        # Native output: the runtime sets the game's r.SetRes live once it runs (runtime_extra.c),
-        # on the analysed eboots only (patches.py GAMES: their 4K framebuffer pool patch).
-        from patches import (eboot_matches, game_app_version, game_profile as patch_profile,
-                             game_title_id)
-        # The version's own entry: without it the first entry of the game (01.00) would be
-        # compared with a 01.02 eboot and every native output would be refused.
-        known = patch_profile(game_title_id(game), game_app_version(game))
-        known_build = bool(known and known[3]) and eboot_matches(game, known)
-        output = ue4_override.NATIVE_OUTPUT.get(graphics['render_resolution'])
-        if output and known_build:
-            env.setdefault('GOW3_UE4_SETRES', output)
-            # The game's UI window takes the display size at start: reported at the output size,
-            # so menus and the debug menu can be navigated across the whole 4K screen (issue #11).
-            width, height = output.split('x')
-            env.setdefault('GOW3_INTERNAL_WIDTH', width)
-            env.setdefault('GOW3_INTERNAL_HEIGHT', height)
-        elif output:
-            print('Native output: this game build is not one of the analysed eboots; output stays 1080p',
-                  flush=True)
+        # The game's output size (medievil.ini output_resolution); the 3D scene's render_scale is in
+        # ue4_override.apply.
+        width, height = graphics_options.output_size(graphics['output_resolution'])
+        output = f'{width}x{height}'
+        print(f'Output resolution: {output}' + (' (the display)' if graphics['output_resolution'] == 'display'
+                                                 else ''), flush=True)
+        graphics_options.output_environment(env, width, height)
+        graphics_options.hzb_full_size_environment(env, width, height, int(graphics['render_scale']))
+        graphics_options.nav_purge_environment(env)
+        graphics_options.particle_single_fixed_environment(env)
+        # HZB occlusion through the runtime's remap (research: T-HZ4, study-hzb-double-buffer.md):
+        # its hooks fit the analysed eboot only. Small read-only buffers the CPU did not write are
+        # bound from VRAM instead of copied every draw (S2, T-S2b). GOW3_HZB_REMAP=0 /
+        # GOW3_STREAM_CLEAN=0: off.
+        from patches import (eboot_matches as hzb_eboot_matches, game_app_version as hzb_version,
+                             game_profile as hzb_profile, game_title_id as hzb_title)
+        known = hzb_profile(hzb_title(game), hzb_version(game))  # 01.00 and 01.02: src/hzb_hook.h
+        if known and known[3] and hzb_eboot_matches(game, known):
+            env.setdefault('GOW3_HZB_REMAP', '1')
+        env.setdefault('GOW3_STREAM_CLEAN', '1')
     for key, value in profile['env'].items():
         env.setdefault(key, value)
     profile_ue4 = bool(profile.get('ue4_render_scale'))
@@ -173,13 +225,21 @@ def main():
         import ue4_override
         try:
             ini = graphics_options.read_ini(env['GOW3_CONFIG'])
-            print('Render resolution:', ue4_override.apply(game, graphics['render_resolution'],
+            # The graphics settings (graphics_options.GRAPHICS_SETTINGS) decide the console variables,
+            # not the quality level: every difference between levels is a setting.
+            choices = graphics_options.graphics_choices(ini)
+            level = graphics_options.matched_level(choices, ini.get('ue4_quality', 'console'))
+            print(f"Graphics: quality {level or 'custom'}; "
+                  + ', '.join(f'{k}={v}' for k, v in choices.items()), flush=True)
+            print('Render resolution:', ue4_override.apply(game, output, int(graphics['render_scale']),
                                                            ini.get('ue4_quality', 'console'), engine_fps,
                                                            ini.get('cheat_menu') == '1',
                                                            ini.get('cheat_infinite_ammo') == '1',
-                                                           ini.get('ue4_upscale', 'off'),
+                                                           env.get('GOW3_HZB_REMAP') == '1',
+                                                           ini.get('effects_resolution', '75'),
                                                            ini.get('ue4_aa', 'taa'),
-                                                           ini.get('ue4_voice', '')), flush=True)
+                                                           ini.get('ue4_voice', ''),
+                                                           graphics_options.graphics_cvars(choices)), flush=True)
         except (OSError, ValueError) as error:
             print(f'Render resolution: unchanged ({error})', flush=True)
     original_game = game.resolve()
@@ -241,7 +301,7 @@ def main():
         if 'GOW3_VBLANK_HZ' not in env:
             env['GOW3_VBLANK_HZ'] = '60'
             derived.append('GOW3_VBLANK_HZ')
-        env['GOW3_DERIVED'] = ','.join(derived)
+        env['GOW3_DERIVED'] = ','.join(sorted(set(derived) | (set(env) - given)))
 
         # The in-game restart starts this script again once this process is gone.
         # GPU caches (shaders, pipelines) beside the saves; read before main(), so set here.
@@ -267,6 +327,28 @@ def main():
                    '--patches', str(out / 'patches.bin'), '--app0', str(game),
                    '--user', str(user_dir),
                    '--timeout', env.get('GOW3_TIMEOUT', '0'), *args]
+        if capture := env.get('GOW3_RENDERDOC'):
+            # Diagnostics: run under RenderDoc (its capture key, F12 / Print Screen, saves a frame
+            # to <capture>_frameN.rdc); -w waits for the game, so the log still follows it.
+            renderdoc = env.get('GOW3_RENDERDOC_CMD', r'C:\Program Files\RenderDoc\renderdoccmd.exe')
+            command = [renderdoc, 'capture', '-w', '-c', capture, *command]
+        elif trace_dir := env.get('GOW3_NGFX'):
+            # Diagnostics: Nsight Graphics GPU Trace into <trace_dir>; F11 in the game starts a trace
+            # (GOW3_NGFX_ARGS: other ngfx options). ngfx splits --args on spaces and keeps only
+            # backslash-escaped quotes, which list2cmdline twice gives (once here, once for ngfx's own
+            # command line). The game inherits this environment (checked with ngfx-test.ps1).
+            ngfx = env.get('GOW3_NGFX_CMD', r'C:\Program Files\NVIDIA Corporation\Nsight Graphics 2026.3.1'
+                           r'\host\windows-desktop-nomad-x64\ngfx.exe')
+            # --real-time-shader-profiler: samples per shader (time per shader in the Shader Pipelines
+            # view); it replaces some detailed SM / L1TEX counters, not the frame-level ones.
+            options = env.get('GOW3_NGFX_ARGS', '--start-after-hotkey --limit-to-frames 5 --max-duration-ms 2000 '
+                              '--architecture Ada --metric-set-id 2 --real-time-shader-profiler '
+                              '--auto-export --keep-going').split()
+            # --no-timeout: ngfx otherwise gave up while a trace was collected ("Operation timeout"), and
+            # ending its session closed the game (ngfx-narrow-1, 2026-10-28).
+            command = [ngfx, '--no-timeout', '--activity', 'GPU Trace Profiler', '--output-dir', trace_dir,
+                       '--exe', command[0], '--dir', os.getcwd(), '--args', subprocess.list2cmdline(command[1:]),
+                       *options]
         # No stdin: an inherited pipe (shells such as Git Bash) cost the game its console output.
         return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
     finally:

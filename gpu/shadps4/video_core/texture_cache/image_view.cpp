@@ -96,6 +96,11 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     if (!info.is_storage) {
         usage_ci.usage &= ~vk::ImageUsageFlagBits::eStorage;
     }
+    if (image.info.props.is_volume && info.type == AmdGpu::ImageType::Color2DArray) {
+        // gow3: a 2D array view of a 3D image may only be an attachment (2D-array compatible).
+        usage_ci.usage &= vk::ImageUsageFlagBits::eColorAttachment |
+                          vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+    }
     // gow3: without VK_EXT_image_2d_view_of_3d a 2D (array) view of a 3D image may only be a
     // render target (the sampled and storage usages were undefined behaviour: issue #18).
     if (image.info.type == AmdGpu::ImageType::Color3D && info.type != AmdGpu::ImageType::Color3D &&
@@ -122,6 +127,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         format = image.info.pixel_format;
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
+    view_aspect = aspect;
 
     // gow3: storage writes never convert to sRGB and sRGB formats cannot be storage images
     // (AMD's driver loses the device on such a view; NVIDIA tolerates it): write through the

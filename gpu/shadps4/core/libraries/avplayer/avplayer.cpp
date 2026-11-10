@@ -7,16 +7,83 @@
 #include "core/libraries/avplayer/avplayer_impl.h"
 #include "core/libraries/libs.h"
 
+#include <chrono>
+#include <cstdio>
+#include <mutex>
+#include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace Libraries::AvPlayer {
+
+namespace {
+// gow3: one line per player call (not the per-frame polls) and the frames each player handed
+// to the game: MediEvil's 197 s intro kept decoding and uploading 1080p frames into gameplay
+// (90 MiB/s of texture uploads for 200 s in every run); this shows what the game asked for.
+struct PlayerTrace {
+    std::string source;
+    unsigned long long frames = 0;
+};
+std::mutex trace_mutex;
+std::unordered_map<const void*, PlayerTrace> traces;
+
+double TraceSeconds() {
+    static const auto start = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+void Trace(const void* handle, const char* call, std::string_view detail, long long result) {
+    std::scoped_lock lock{trace_mutex};
+    auto& trace = traces[handle];
+    std::printf("AvPlayer %.3f s: %p %s%s%.*s -> %lld (%s, %llu frames delivered)\n", TraceSeconds(),
+                handle, call, detail.empty() ? "" : " ", int(detail.size()), detail.data(), result,
+                trace.source.empty() ? "no source" : trace.source.c_str(), trace.frames);
+    std::fflush(stdout);
+}
+
+void TraceSource(const void* handle, std::string_view path) {
+    std::scoped_lock lock{trace_mutex};
+    traces[handle] = {std::string{path}, 0};
+}
+
+void TraceFrame(const void* handle) {
+    std::scoped_lock lock{trace_mutex};
+    ++traces[handle].frames;
+}
+
+void TraceForget(const void* handle) {
+    std::scoped_lock lock{trace_mutex};
+    traces.erase(handle);
+}
+} // namespace
+
+// gow3: called by the game's level change (src/probe.c, the OpenLevel hook): suspends every movie
+// still playing. MediEvil plays its intro on a player it never stops after the skip; it kept
+// decoding and uploading 1080p frames for ~200 s into gameplay (research/docs/study-intro-movie.md).
+// The traces map holds the live players (Close forgets a handle before deleting it, under the
+// same mutex).
+void SuspendPlayersForLevelChange() {
+    std::scoped_lock lock{trace_mutex};
+    for (const auto& [handle, trace] : traces) {
+        auto* player = const_cast<AvPlayer*>(static_cast<const AvPlayer*>(handle));
+        if (player->Suspend()) {
+            std::printf("AvPlayer %.3f s: %p suspended at a level change (%s, %llu frames delivered)\n",
+                        TraceSeconds(), handle, trace.source.empty() ? "no source" : trace.source.c_str(),
+                        trace.frames);
+        }
+    }
+    std::fflush(stdout);
+}
 
 s32 PS4_SYSV_ABI sceAvPlayerAddSource(AvPlayerHandle handle, const char* filename) {
     LOG_TRACE(Lib_AvPlayer, "filename = {}", filename);
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    return handle->AddSource(filename);
+    TraceSource(handle, filename ? filename : "");
+    const s32 result = handle->AddSource(filename);
+    Trace(handle, "AddSource", "", result);
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerAddSourceEx(AvPlayerHandle handle, AvPlayerUriType uri_type,
@@ -26,7 +93,10 @@ s32 PS4_SYSV_ABI sceAvPlayerAddSourceEx(AvPlayerHandle handle, AvPlayerUriType u
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
     const auto path = std::string_view(source_details->uri.name, source_details->uri.length);
-    return handle->AddSourceEx(path, source_details->source_type);
+    TraceSource(handle, path);
+    const s32 result = handle->AddSourceEx(path, source_details->source_type);
+    Trace(handle, "AddSourceEx", "", result);
+    return result;
 }
 
 int PS4_SYSV_ABI sceAvPlayerChangeStream() {
@@ -39,6 +109,8 @@ s32 PS4_SYSV_ABI sceAvPlayerClose(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    Trace(handle, "Close", "", ORBIS_OK);
+    TraceForget(handle);
     delete handle;
     return ORBIS_OK;
 }
@@ -98,7 +170,11 @@ bool PS4_SYSV_ABI sceAvPlayerGetVideoDataEx(AvPlayerHandle handle,
     if (handle == nullptr || video_info == nullptr) {
         return false;
     }
-    return handle->GetVideoData(*video_info);
+    const bool got = handle->GetVideoData(*video_info);
+    if (got) {
+        TraceFrame(handle);
+    }
+    return got;
 }
 
 AvPlayerHandle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
@@ -115,7 +191,9 @@ AvPlayerHandle PS4_SYSV_ABI sceAvPlayerInit(AvPlayerInitData* data) {
         return nullptr;
     }
 
-    return new AvPlayer(*data);
+    auto* player = new AvPlayer(*data);
+    Trace(player, "Init", data->auto_start ? "auto start" : "", 0);
+    return player;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerInitEx(const AvPlayerInitDataEx* p_data, AvPlayerHandle* p_player) {
@@ -141,6 +219,7 @@ s32 PS4_SYSV_ABI sceAvPlayerInitEx(const AvPlayerInitDataEx* p_data, AvPlayerHan
     data.auto_start = p_data->auto_start;
 
     *p_player = new AvPlayer(data);
+    Trace(*p_player, "InitEx", data.auto_start ? "auto start" : "", 0);
     return ORBIS_OK;
 }
 
@@ -157,6 +236,7 @@ s32 PS4_SYSV_ABI sceAvPlayerJumpToTime(AvPlayerHandle handle, uint64_t time) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    Trace(handle, "JumpToTime (stub)", std::to_string(time), ORBIS_OK);
     return ORBIS_OK;
 }
 
@@ -165,7 +245,9 @@ s32 PS4_SYSV_ABI sceAvPlayerPause(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    return handle->Pause();
+    const s32 result = handle->Pause();
+    Trace(handle, "Pause", "", result);
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerPostInit(AvPlayerHandle handle, AvPlayerPostInitData* data) {
@@ -186,7 +268,9 @@ s32 PS4_SYSV_ABI sceAvPlayerResume(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    return handle->Resume();
+    const s32 result = handle->Resume();
+    Trace(handle, "Resume", "", result);
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerSetAvSyncMode(AvPlayerHandle handle, AvPlayerAvSyncMode sync_mode) {
@@ -208,8 +292,10 @@ s32 PS4_SYSV_ABI sceAvPlayerSetLooping(AvPlayerHandle handle, bool loop_flag) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
     if (!handle->SetLooping(loop_flag)) {
+        Trace(handle, "SetLooping", loop_flag ? "on" : "off", ORBIS_AVPLAYER_ERROR_OPERATION_FAILED);
         return ORBIS_AVPLAYER_ERROR_OPERATION_FAILED;
     }
+    Trace(handle, "SetLooping", loop_flag ? "on" : "off", ORBIS_OK);
     return ORBIS_OK;
 }
 
@@ -218,6 +304,7 @@ s32 PS4_SYSV_ABI sceAvPlayerSetTrickSpeed(AvPlayerHandle handle, s32 trick_speed
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
+    Trace(handle, "SetTrickSpeed (stub)", std::to_string(trick_speed), ORBIS_OK);
     return ORBIS_OK;
 }
 
@@ -226,7 +313,9 @@ s32 PS4_SYSV_ABI sceAvPlayerStart(AvPlayerHandle handle) {
     if (handle == nullptr) {
         return ORBIS_AVPLAYER_ERROR_INVALID_PARAMS;
     }
-    return handle->Start();
+    const s32 result = handle->Start();
+    Trace(handle, "Start", "", result);
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceAvPlayerStop(AvPlayerHandle handle) {
@@ -236,7 +325,9 @@ s32 PS4_SYSV_ABI sceAvPlayerStop(AvPlayerHandle handle) {
     }
     // gow3: guest code calls this and cannot unwind a C++ exception.
     try {
-        return handle->Stop();
+        const s32 result = handle->Stop();
+        Trace(handle, "Stop", "", result);
+        return result;
     } catch (const std::exception& error) {
         LOG_ERROR(Lib_AvPlayer, "Stop failed: {}", error.what());
         return ORBIS_AVPLAYER_ERROR_OPERATION_FAILED;
@@ -287,3 +378,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 };
 
 } // namespace Libraries::AvPlayer
+
+// The guest-facing entry of the level-change hook (src/probe.c, MEDIEVIL_OPEN_LEVEL_CALL): called
+// from guest code, so System V.
+extern "C" void __attribute__((sysv_abi)) medievil_level_change(void) {
+    Libraries::AvPlayer::SuspendPlayersForLevelChange();
+}

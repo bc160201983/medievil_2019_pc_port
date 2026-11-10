@@ -324,9 +324,26 @@ void DrawPreparation::Collect() {
     }
 }
 
+/// gow3 GOW3_PREP_PRIORITY=below (T-S5: in the bursts of new content most draws arrived unprepared;
+/// the scanner and workers ran at the idle priority, starved while the game streams): below
+/// normal instead. Default: idle (only otherwise idle cores).
+static void PrepThreadPriority() {
+#ifdef _WIN32
+    static const bool below = [] {
+        const char* env = std::getenv("GOW3_PREP_PRIORITY");
+        return env && std::strcmp(env, "below") == 0;
+    }();
+    if (below) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        return;
+    }
+#endif
+    Gow3Threads::MakeBackground();
+}
+
 void DrawPreparation::ScannerLoop(std::stop_token stop) {
     Common::SetCurrentThreadName("gow3:DrawScan");
-    Gow3Threads::MakeBackground();
+    PrepThreadPriority();
     std::unique_ptr<AmdGpu::Regs> regs;
     u64 checksum = 0;
     u64 next_seq = 0;
@@ -380,7 +397,7 @@ void DrawPreparation::ScannerLoop(std::stop_token stop) {
 
 void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
     Common::SetCurrentThreadName(("gow3:DrawPrep" + std::to_string(index)).c_str());
-    Gow3Threads::MakeBackground();
+    PrepThreadPriority();
     auto regs = std::make_unique<AmdGpu::Regs>();
     constexpr u64 NoPosition = ~0ull;
     u64 position = NoPosition; ///< `regs` holds the state at the start of this buffer
@@ -485,6 +502,7 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
 
 void DrawPreparation::Count(bool was_used) {
     ++(was_used ? used : unused);
+    if (!was_used && Gow3Stats::enabled) Gow3Stats::unprepared_draws.fetch_add(1, std::memory_order_relaxed);
     static const bool stats = std::getenv("GOW3_FRAME_STATS") != nullptr;
     // The clock is read every 1024 draws: per draw it was 8% of the GPU thread.
     if (!stats || ((used + unused) & 1023) != 0) {

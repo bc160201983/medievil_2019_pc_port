@@ -17,11 +17,15 @@ typedef struct Rwlock {
     pthread_rwlock_t native;
     Holder *holders;
     unsigned inflight;
-    struct Rwlock *next;
 } Rwlock;
 typedef struct { int64_t seconds, nanoseconds; } GuestTime;
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
-static Rwlock *registry;
+/* Live locks: an open-addressing set of pointers (every call validates its handle; a list walk
+   over every lock was 11.8% of MediEvil's main thread). Deleted slots hold &deleted, never 1,
+   the value rw_destroy leaves in a destroyed handle. */
+static Rwlock deleted;
+static Rwlock **registry;
+static size_t registry_size, registry_used, registry_live;
 static size_t created, reads, writes, unlocks;
 static int32_t error(int e) {
     if (!e) return 0;
@@ -39,16 +43,48 @@ static int32_t error(int e) {
     return (int32_t)(UINT32_C(0x80020000)|code);
 }
 /* All helpers ending in _locked require registry_lock. */
+static size_t slot_of(const Rwlock *r) {
+    return (size_t)(((uintptr_t)r >> 4) * UINT64_C(0x9E3779B97F4A7C15) >> 32) & (registry_size-1);
+}
+static Rwlock **find_slot_locked(const Rwlock *handle) {
+    if (!handle || handle==&deleted || !registry) return NULL;
+    for (size_t i=slot_of(handle);; i=(i+1)&(registry_size-1)) {
+        if (!registry[i]) return NULL;
+        if (registry[i]==handle) return &registry[i];
+    }
+}
 static Rwlock *find_locked(Rwlock *handle) {
-    for (Rwlock *r=registry; r; r=r->next) if (r==handle) return r;
-    return NULL;
+    Rwlock **slot=find_slot_locked(handle);
+    return slot ? *slot : NULL;
+}
+/* Keeps at most half the slots used (live and deleted): rebuilt at 4x the live count. */
+static int reserve_locked(void) {
+    if ((registry_used+1)*2<=registry_size) return 0;
+    size_t size=64;
+    while (size<(registry_live+1)*4) size*=2;
+    Rwlock **table=calloc(size,sizeof(*table));
+    if (!table) return ENOMEM;
+    Rwlock **old=registry; size_t old_size=registry_size;
+    registry=table; registry_size=size; registry_used=0;
+    for (size_t i=0;i<old_size;++i) if (old[i] && old[i]!=&deleted) {
+        size_t j=slot_of(old[i]);
+        while (registry[j]) j=(j+1)&(size-1);
+        registry[j]=old[i]; ++registry_used;
+    }
+    free(old);
+    return 0;
 }
 static int create_locked(Rwlock **out) {
+    if (reserve_locked()) return ENOMEM;
     Rwlock *r=calloc(1,sizeof(*r));
     if (!r) return ENOMEM;
     int e=pthread_rwlock_init(&r->native,NULL);
     if (e) { free(r); return e; }
-    r->next=registry; registry=r; *out=r; ++created; return 0;
+    size_t i=slot_of(r);
+    while (registry[i] && registry[i]!=&deleted) i=(i+1)&(registry_size-1);
+    if (!registry[i]) ++registry_used;
+    registry[i]=r; ++registry_live;
+    *out=r; ++created; return 0;
 }
 static ABI int32_t rw_init(Rwlock **out, void *const *attr, const char *name) {
     (void)name;
@@ -131,14 +167,14 @@ static ABI int32_t rw_destroy(Rwlock **handle) {
     if (!handle) return error(EINVAL);
     pthread_mutex_lock(&registry_lock);
     if (!*handle) { pthread_mutex_unlock(&registry_lock); return 0; }
-    Rwlock *r=find_locked(*handle);
-    if (!r) { pthread_mutex_unlock(&registry_lock); return error(EINVAL); }
+    Rwlock **slot=find_slot_locked(*handle);
+    if (!slot) { pthread_mutex_unlock(&registry_lock); return error(EINVAL); }
+    Rwlock *r=*slot;
     if (r->inflight || r->holders) { pthread_mutex_unlock(&registry_lock); return error(EBUSY); }
     int e=pthread_rwlock_destroy(&r->native);
     if (!e) {
-        Rwlock **link=&registry;
-        while (*link!=r) link=&(*link)->next;
-        *link=r->next; free(r); *handle=(Rwlock *)(uintptr_t)1;
+        *slot=&deleted; --registry_live;
+        free(r); *handle=(Rwlock *)(uintptr_t)1;
     }
     pthread_mutex_unlock(&registry_lock); return error(e);
 }

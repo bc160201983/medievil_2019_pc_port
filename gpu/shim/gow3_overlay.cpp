@@ -27,6 +27,8 @@ extern std::atomic<bool> screenshot_requested;
 }
 extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends this process
 extern "C" void runtime_ue4_request_setres(const char* text); // src/runtime_extra.c: live r.SetRes
+extern "C" void runtime_ue4_request_cvar(const char* name, const char* value); // live console variables
+extern "C" void runtime_ue4_particle_single_pass(int on); // src/runtime_extra.c: r.GPUParticle.FixDeltaSeconds
 u32 Gow3DisplayRefreshHz(); // gow3gpu.cpp: the display refresh rate
 #include "common/elf_info.h"
 #include "imgui.h"
@@ -35,6 +37,8 @@ u32 Gow3DisplayRefreshHz(); // gow3gpu.cpp: the display refresh rate
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "video_core/renderer_vulkan/vk_ue4_motion.h"
+#include "video_core/renderer_vulkan/vk_ue4_dlss.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -94,13 +98,30 @@ float base_scale = 1.0f;
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
 
+// MediEvil render scale (Performance > Applied now): each change reallocates every scene target
+// in the game, so a new value is applied once the slider is let go and no step came for 0.3 s
+// (or when the menu closes), not at every step of a drag.
+bool render_scale_pending = false;
+std::chrono::steady_clock::time_point render_scale_edit{};
+
+void ApplyRenderScale(bool now) {
+    if (!render_scale_pending ||
+        (!now && std::chrono::steady_clock::now() - render_scale_edit < std::chrono::milliseconds(300))) {
+        return;
+    }
+    render_scale_pending = false;
+    Gow3Settings::RequestRenderScale(Gow3Settings::Get().render_scale);
+}
+
 void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
         return;
     }
-    ImGui::GetIO().MouseDrawCursor = value;
     if (value) {
         requested_tab = Gow3Settings::Get().menu_tab;
+    }
+    if (!value) {
+        ApplyRenderScale(true);
     }
     if (!value && dirty) {
         dirty = false;
@@ -414,6 +435,13 @@ void ImageTab() {
         ImGui::BeginDisabled(!s.rcas || rcas_blocked);
         SliderRow("Sharpening strength", s.rcas_strength, 0, 100, "%d%%", "How strong the sharpening is.");
         ImGui::EndDisabled();
+        ImGui::BeginDisabled(!s.ue4_dlss_available);
+        CheckRow("NVIDIA DLSS", s.ue4_dlss,
+                 s.ue4_dlss_available
+                     ? "Replaces the game's anti-aliasing: DLAA at Render scale 100, DLSS upscaling below it. "
+                       "Sharpening is off while it runs. F9 switches it in the game."
+                     : "Needs an NVIDIA RTX GPU and nvngx_dlss.dll in the bin folder (see README-Windows.txt).");
+        ImGui::EndDisabled();
         ImGui::EndTable();
     }
     ImGui::SeparatorText("Information");
@@ -425,6 +453,145 @@ void ImageTab() {
         InfoRow("Window", text);
         InfoRow("FSR 1", !s.fsr1 ? "off" : upscaling ? "active" : "no effect (image not smaller than window)");
         InfoRow("Sharpening", s.rcas_applied ? "applied" : "not applied");
+        InfoRow("DLSS", Vulkan::Ue4Dlss::Running() ? "running"
+                        : s.ue4_dlss                ? "on (waiting for the game's TAA)"
+                                                    : "off");
+        ImGui::EndTable();
+    }
+}
+
+// Choice over a plain int index (-1: a value the menu does not list, shown until changed).
+void IndexChoiceRow(const char* label, int& value, const char* const* labels, int count, const char* help) {
+    Row(label);
+    const char* preview = value >= 0 && value < count ? labels[value] : "(custom)";
+    if (ImGui::BeginCombo("##value", preview)) {
+        for (int i = 0; i < count; ++i) {
+            if (ImGui::Selectable(labels[i], i == value)) {
+                value = i;
+                dirty = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Help(help);
+    ImGui::PopID();
+}
+
+// MediEvil: the 3D scene's size per side compared with the output, in 1% steps, switched live
+// (Gow3Settings::RequestRenderScale, applied by ApplyRenderScale) and kept in medievil.ini.
+void RenderScaleSection() {
+    namespace S = Gow3Settings;
+    auto& s = S::Get();
+    const int lo = S::LiveRenderScaleMin(), live_max = S::LiveRenderScaleMax();
+    static char help[512];
+    std::snprintf(help, sizeof(help),
+                  "The 3D scene's size per side compared with the output, in 1%% steps. Below 100%%: drawn "
+                  "smaller and rebuilt at full size by the game's temporal upscaler (faster). Above: drawn "
+                  "larger and scaled down (sharper, slower). The HUD stays at the output size. Switched now "
+                  "(each change re-makes the scene's buffers: one short hitch) from %d%% to %d%%; larger "
+                  "values on the next start, as the game's memory is set up for the scene it starts with.",
+                  lo, live_max);
+    if (!BeginRows("##render_scale")) {
+        return;
+    }
+    Row("Render scale");
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float button = ImGui::GetFrameHeight();
+    ImGui::SetNextItemWidth(-(2.0f * (button + style.ItemSpacing.x)));
+    int v = s.render_scale;
+    bool changed = ImGui::SliderInt("##value", &v, lo, S::RenderScaleMax, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+    const bool active = ImGui::IsItemActive();
+    Help(help);
+    ImGui::SameLine();
+    if (ImGui::Button("-", ImVec2(button, 0.0f))) {
+        v = std::max(lo, s.render_scale - 1);
+        changed = true;
+    }
+    Help(help);
+    ImGui::SameLine();
+    if (ImGui::Button("+", ImVec2(button, 0.0f))) {
+        v = std::min(int(S::RenderScaleMax), s.render_scale + 1);
+        changed = true;
+    }
+    Help(help);
+    ImGui::PopID();
+    v = std::clamp(v, lo, int(S::RenderScaleMax));
+    if (changed && v != s.render_scale) {
+        s.render_scale = v;
+        dirty = true;
+        render_scale_pending = true;
+        render_scale_edit = std::chrono::steady_clock::now();
+    }
+    if (active) {
+        render_scale_edit = std::chrono::steady_clock::now(); // applied once let go
+    }
+    const int iw = s.image_width, ih = s.image_height;
+    char text[96];
+    if (iw > 0 && ih > 0) {
+        std::snprintf(text, sizeof(text), "%d x %d at %d%% of %d x %d", S::ScaledSize(iw, s.live_render_scale),
+                      S::ScaledSize(ih, s.live_render_scale), s.live_render_scale, iw, ih);
+    } else {
+        std::snprintf(text, sizeof(text), "%d%%", s.live_render_scale);
+    }
+    InfoRow("Scene now", text);
+    ImGui::EndTable();
+    if (s.render_scale > live_max) {
+        ImGui::TextWrapped("%d%% applies at the next start (Apply and restart). Until then the scene stays at "
+                           "%d%%: live changes go up to %d%%, the scene size the game's memory was set up for "
+                           "when it started.",
+                           s.render_scale, s.live_render_scale, live_max);
+    } else if (S::RenderScaleNeedsRestart()) {
+        ImGui::TextWrapped("Anti-aliasing is not temporal (launcher > Performance): applied now, but the "
+                           "anti-aliasing stays as the game started until the next start (below 100%% a start "
+                           "always uses temporal AA for its upsampling).");
+    }
+}
+
+extern "C" void runtime_memory_set_perf(int optimistic, int keep_access);
+
+// MediEvil: the launcher's performance patches. Live ones apply at once.
+void PerfPatchesSection() {
+    namespace S = Gow3Settings;
+    auto& s = S::Get();
+    static const char* const titles[S::PerfCount] = {
+        "HZB occlusion culling", "Skip the decal depth prepass", "Single GPU particle pass",
+        "Small buffers from VRAM", "Texture set memo", "Lock-free memory map lookups", "Cheap memory frees",
+        "GPU data without waits", "4K memory sizes", "Fewer render pass breaks", "Cheaper draw binding",
+        "Constant ring reuse"};
+    static const char* const hints[S::PerfCount] = {
+        "Skips objects hidden behind others, without waiting for the GPU. Heavy areas ~130 -> ~165 FPS.",
+        "No second depth-only drawing of the scene for nearly invisible decals: ~600 fewer draws, ~10%.",
+        "One particle simulation pass a frame instead of an extra empty one: up to ~190 fewer draws. Off by "
+        "default: some lone torches burn very slowly and an ember stream can show in Dan's crypt with it.",
+        "Unchanged small buffers are read from video memory instead of copied every draw: ~5%.",
+        "Remembered texture bindings survive other textures streaming in: binding ~7% cheaper.",
+        "The GPU threads read the memory map without waiting for the game: fewer panning spikes.",
+        "Freed memory keeps its page access: frees ~7x cheaper, smoother 0.1% lows.",
+        "Readback queue, GPU write twins and deferred fences: removed the constant micro-stutter.",
+        "More graphics memory and texture pool at 4K native: no reloads on small camera moves.",
+        "No depth barriers between effect draws: fights' 0.1% lows 100 -> 117 at a 120 cap.",
+        "Descriptors copied in one piece, samplers reused: ~0.3 ms less draw-thread work in heavy frames.",
+        "Constants bound again in a command buffer reuse their first copy: heavy-area 0.1% lows ~145 -> ~185."};
+    ImGui::SeparatorText("Performance patches");
+    if (BeginRows("##perf_live")) {
+        for (int p = 0; p < S::PerfCount; ++p) {
+            if (S::PerfLive[p]) CheckRow(titles[p], s.perf[p], hints[p]);
+        }
+        ImGui::EndTable();
+    }
+    // The live ones in the memory runtime (src/runtime_memory.c); the buffer cache reads its own.
+    runtime_memory_set_perf(s.perf[S::PerfLockfreeMemory] ? 1 : 0, s.perf[S::PerfCheapFrees] ? 1 : 0);
+    // The particle pass through its console variable at the next game-thread poll (once per change).
+    runtime_ue4_particle_single_pass(s.perf[S::PerfParticleSinglePass] ? 1 : 0);
+    if (Gow3Toggle2::Disabled(Gow3Toggle2::ParticleFixedStep)) {
+        ImGui::TextDisabled("Single GPU particle pass: held off by the toggle file (second word 8192); this "
+                            "choice applies when that bit clears.");
+    }
+    ImGui::TextDisabled("Applied on restart:");
+    if (BeginRows("##perf_restart")) {
+        for (int p = 0; p < S::PerfCount; ++p) {
+            if (!S::PerfLive[p]) CheckRow(titles[p], s.perf[p], hints[p]);
+        }
         ImGui::EndTable();
     }
 }
@@ -434,11 +601,16 @@ void PerformanceTab() {
     auto& s = Gow3Settings::Get();
     ImGui::SeparatorText("Live");
     if (BeginRows("##live")) {
-        static const char* const fps_labels[] = {"30", "60", "120", "240", "Unlimited",
-                                                 "Half display refresh (smoothest)"};
+        static const char* const fps_labels[] = {"Auto: refresh (VRR: below it, Reflex rule)",
+                                                 "Auto: half refresh (VRR: one below)", "30", "60", "119 (VRR, 240 Hz)",
+                                                 "120", "141 (VRR, 144 Hz)", "237 (VRR, 240 Hz)", "240", "Unlimited",
+                                                 "Half display refresh (fixed refresh)"};
         ChoiceRow("Frame rate limit", s.fps_limit, fps_labels, G::FpsLimits.data(), int(G::FpsLimits.size()),
                   "Caps the frame rate. The engine frame rate (below) is the highest it can go.");
-        const int limit = s.fps_limit < 0 ? int(Gow3DisplayRefreshHz() / 2) : s.fps_limit.load();
+        CheckRow("G-Sync / FreeSync display", s.display_vrr,
+                 "On: the automatic limits stay just below the refresh (VRR). Off (fixed refresh): exactly the "
+                 "refresh or half of it, with VSync on.");
+        const int limit = G::ResolveFpsLimit(s.fps_limit, Gow3DisplayRefreshHz(), s.display_vrr);
         const int effective = G::EffectiveFps(limit, s.startup_engine_fps);
         if (s.fps_limit < 0) {
             char text[64];
@@ -462,10 +634,11 @@ void PerformanceTab() {
         ImGui::SeparatorText("Game resolution now");
         static constexpr const char* labels[] = {"1080p", "1440p", "1800p", "4K"};
         static constexpr const char* values[] = {"1920x1080", "2560x1440", "3200x1800", "3840x2160"};
-        // The 1440p, 1800p and 4K render resolutions supersample (r.ScreenPercentage up to 200):
-        // a larger output on top of that ran out of the PS4 memory budget (1800p at 200% needs
-        // 6400x3600 targets: crash). Those keep 1080p.
-        const bool supersampling = s.startup_render_resolution >= 3 && s.startup_render_resolution <= 5;
+        // Render scales above 100% supersample (r.ScreenPercentage up to 200): a larger output on
+        // top of that ran out of the PS4 memory budget (1800p at 200% needs 6400x3600 targets:
+        // crash). Those keep 1080p here.
+        // A live render scale stays at or below the start's when that is above 100% (RequestRenderScale).
+        const bool supersampling = s.startup_render_scale > 100;
         for (int i = 0; i < 4; ++i) {
             if (i) {
                 ImGui::SameLine();
@@ -476,23 +649,86 @@ void PerformanceTab() {
             }
             ImGui::EndDisabled();
         }
-        ImGui::TextWrapped(supersampling
-                               ? "Unavailable with the 1440p / 1800p / 4K render resolutions (they already "
-                                 "draw the scene larger; more would run out of game memory). Choose Native "
-                                 "or a native output mode to switch the output size here."
-                               : "Switches the game's output now. Use 1080p for the debug menu (R3), then "
-                                 "switch back.");
+        ImGui::TextWrapped("%s", supersampling
+                                     ? "Unavailable when the game started with a render scale above 100% (the "
+                                       "scene is already drawn larger; more would run out of game memory). Start "
+                                       "with Render scale 100% or lower to switch the output size here."
+                                     : "Switches the game's output now, until the next start (Output resolution "
+                                       "below is the size it starts at). Use 1080p for the debug menu (R3), then "
+                                       "switch back.");
+        // UE4 console variables switched live (src/runtime_extra.c), kept in medievil.ini.
+        ImGui::SeparatorText("Applied now");
+        RenderScaleSection();
+        if (BeginRows("##live")) {
+            const bool preshadows = s.preshadows;
+            CheckRow("Preshadows", s.preshadows,
+                     "Shadows that Dan and enemies cast from fixed lights such as torches. Off: "
+                     "faster in busy views with many lights (the Graveyard horizon held the frame "
+                     "cap); some of those shadows go.");
+            if (s.preshadows != preshadows) {
+                runtime_ue4_request_cvar("r.Shadow.Preshadows", s.preshadows ? "1" : "0");
+            }
+            static const char* const effects_labels[] = {"100%", "75%", "50%"};
+            const int effects = s.effects_resolution;
+            IndexChoiceRow("Effects resolution", s.effects_resolution, effects_labels, 3,
+                           "Smoke, fire and enemy death effects drawn at a lower resolution and "
+                           "blended in. At 4K, 50% is the PS4's 1080p effect detail; several deaths "
+                           "at once cost 2-3 ms a frame at 100%. The cost grows with the render resolution.");
+            if (s.effects_resolution != effects && s.effects_resolution >= 0) {
+                runtime_ue4_request_cvar("r.SeparateTranslucencyScreenPercentage",
+                                         Gow3Settings::UE4EffectsKeys[s.effects_resolution]);
+            }
+            // Graphics quality sets every graphics setting (the live ones now, the others below at the next
+            // start); it shows the level they all match, else Custom (research/docs/plan-graphics-settings.md).
+            {
+                namespace S = Gow3Settings;
+                static const char* const quality_labels[] = {"Ultra", "High", "Console (PS4)", "Medium",
+                                                             "Low (integrated graphics)", "Deck Optimized"};
+                const int matched = S::UE4MatchedLevel(s, s.ue4_quality);
+                Row("Graphics quality");
+                if (ImGui::BeginCombo("##value", matched >= 0 ? quality_labels[matched] : "Custom")) {
+                    for (int level = 0; level < int(std::size(S::UE4QualityKeys)); ++level) {
+                        if (ImGui::Selectable(quality_labels[level], level == matched)) {
+                            S::UE4ApplyLevel(level);
+                            dirty = true;
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                Help("Sets every graphics setting: Console is exactly the PS4, High and Ultra go beyond it, "
+                     "Medium and Low are for integrated graphics. Custom: some settings changed by hand. "
+                     "The settings under \"Applied on restart\" take effect at the next start.");
+                ImGui::PopID();
+            }
+            for (int o = 0; o < Gow3Settings::UE4LiveCount; ++o) {
+                const auto& option = Gow3Settings::UE4LiveOptions[o];
+                if (!option.live) continue; // under "Applied on restart"
+                const int before = s.ue4_live[o];
+                IndexChoiceRow(option.title, s.ue4_live[o], option.labels, option.count, option.hint);
+                if (s.ue4_live[o] != before) {
+                    Gow3Settings::RequestUE4Live(o, s.ue4_live[o]);
+                }
+            }
+            ImGui::EndTable();
+        }
     }
     ImGui::SeparatorText("Applied on restart");
     if (BeginRows("##restart")) {
-        // God of War III: a resolution patch. Unreal Engine 4 games (MediEvil): the scene scale.
-        static const char* const resolution_labels[] = {
-            "Native (1080p)", "480p", "720p", "1440p", "1800p", "4K",
-            "720p native output", "1440p native output", "1800p native output", "4K native output"};
-        ChoiceRow("Render resolution", s.render_resolution, resolution_labels, nullptr,
-                  int(G::Resolutions.size()),
-                  IsGow3() ? "The resolution the game draws at. Higher is sharper and slower."
-                           : "The resolution the 3D scene is drawn at, shown at 1080p: 4K is the sharpest.");
+        if (IsGow3()) {
+            // God of War III: a resolution patch.
+            static const char* const resolution_labels[] = {
+                "1080p (original)", "480p", "720p", "1440p", "1800p", "4K", "720p", "1440p", "1800p", "4K"};
+            ChoiceRow("Render resolution", s.render_resolution, resolution_labels, nullptr,
+                      int(G::Resolutions.size()), "The resolution the game draws at. Higher is sharper and slower.");
+        } else {
+            // MediEvil: the size the game starts at (launcher > Performance; run.py: the boot display
+            // size patch). Its render scale is live, above (RenderScaleSection).
+            static const char* const output_labels[] = {"Match display", "4K (3840x2160)", "1800p (3200x1800)",
+                                                        "1440p (2560x1440)", "1080p (original)", "720p (1280x720)"};
+            IndexChoiceRow("Output resolution", s.output_resolution, output_labels, 6,
+                           "The size of the game's picture; it starts at this size. Match the display for a "
+                           "sharp 1:1 image. Custom sizes: output_resolution=WxH in medievil.ini.");
+        }
         // The highest frame rate the game runs at (Unreal Engine 4: run.py's override pak).
         static const char* const engine_labels[] = {"60 (original)", "120 (experimental)", "240 (experimental)"};
         ChoiceRow("Engine frame rate", s.engine_fps, engine_labels, G::EngineFps.data(),
@@ -501,7 +737,19 @@ void PerformanceTab() {
                  "Big FPS gain. Switch it off if lighting or objects look wrong.");
         CheckRow("Deferred GPU readbacks", s.deferred_readback,
                  "Fewer waits for the GPU. Switch it off if textures or shadows look wrong.");
+        if (!IsGow3()) {
+            // MediEvil: the graphics settings that are not live (Graphics quality, above, sets them too).
+            for (int o = 0; o < Gow3Settings::UE4LiveCount; ++o) {
+                const auto& option = Gow3Settings::UE4LiveOptions[o];
+                if (!option.live) {
+                    IndexChoiceRow(option.title, s.ue4_live[o], option.labels, option.count, option.hint);
+                }
+            }
+        }
         ImGui::EndTable();
+    }
+    if (!IsGow3()) {
+        PerfPatchesSection();
     }
 }
 
@@ -577,15 +825,13 @@ void OverlayTab() {
     }
 }
 
-// Startup options changed since this launch (applied by "Apply and restart").
 int RestartChanges() {
-    const auto& s = Gow3Settings::Get();
-    return (s.render_resolution != s.startup_render_resolution) + (s.engine_fps != s.startup_engine_fps) +
-           (s.deferred_readback != s.startup_deferred_readback) + (s.stale_readback != s.startup_stale_readback);
+    return Gow3Settings::RestartChanges();
 }
 
 void Menu() {
     auto& s = Gow3Settings::Get();
+    ApplyRenderScale(false);
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
                                    viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
@@ -866,6 +1112,22 @@ void FpsCounter() {
     ImGui::End();
 }
 
+// F8 / F9 (UE4 DLSS): what the key switched to, large, top centre, for 3 s.
+void DlssNotice(const char* text) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + 40.0f * base_scale),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::Begin("##dlss_notice", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
+                     ImGuiWindowFlags_NoNav);
+    ImGui::SetWindowFontScale(2.0f);
+    ImGui::TextUnformatted(text);
+    ImGui::End();
+}
+
 void BackgroundLoading() {
     const u32 done = background_done, total = std::max(background_total.load(), 1u);
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -1110,13 +1372,35 @@ bool HandleEvent(const SDL_Event& event) {
             Vulkan::FrameCapture::Request();
             return true;
         }
+        // F9: DLAA / UE4's TAA (GOW3_UE4_DLSS=1 only). Not with Ctrl or Alt: NVIDIA's development
+        // DLSS DLL uses Ctrl+Alt+F9 / F10 / F12 for its own debug hotkeys.
+        const bool plain_key = !(event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT));
+        // F8: the next jitter sign handed to DLSS (GOW3_UE4_DLSS=1 only), shown on screen.
+        if (down && !event.key.repeat && plain_key && event.key.key == SDLK_F8 &&
+            Vulkan::Ue4Dlss::Enabled()) {
+            Vulkan::Ue4Dlss::CycleJitterSign();
+            return true;
+        }
+        if (down && !event.key.repeat && plain_key && event.key.key == SDLK_F9 &&
+            Vulkan::Ue4Dlss::Enabled()) {
+            Vulkan::Ue4Dlss::Toggle();
+            Gow3Settings::Save();
+            return true;
+        }
+        // F10: the next UE4 motion vector view (GOW3_UE4_MOTION_VIEW set only).
+        if (down && !event.key.repeat && plain_key && event.key.key == SDLK_F10 &&
+            Vulkan::Ue4Motion::Enabled()) {
+            Vulkan::Ue4Motion::CycleViewMode();
+            return true;
+        }
         // F12: a PNG screenshot of the game's picture. Shift+F12: raw frames for bug reports
         // (GOW3_FRAME_DUMP_TRIGGER, set by the launcher).
-        if (down && !event.key.repeat && event.key.key == SDLK_F12 && !(event.key.mod & SDL_KMOD_SHIFT)) {
+        if (down && !event.key.repeat && plain_key && event.key.key == SDLK_F12 &&
+            !(event.key.mod & SDL_KMOD_SHIFT)) {
             screenshot_requested.store(true, std::memory_order_release);
             return true;
         }
-        if (down && !event.key.repeat && event.key.key == SDLK_F12) {
+        if (down && !event.key.repeat && plain_key && event.key.key == SDLK_F12) {
             if (const char* trigger = std::getenv("GOW3_FRAME_DUMP_TRIGGER")) {
                 if (std::FILE* f = std::fopen(trigger, "wb")) {
                     std::fclose(f);
@@ -1250,7 +1534,7 @@ bool Visible() {
     const auto& s = Gow3Settings::Get();
     return initialized && (loading || background_total || menu_open || text_entry_active || choice_active ||
                            runtime_disabled_optimizations != 0 ||
-                           choice_retiring || s.show_fps ||
+                           choice_retiring || s.show_fps || Vulkan::Ue4Dlss::Notice() ||
                            (s.actor_watch_supported && s.enemy_health_bar));
 }
 
@@ -1282,9 +1566,13 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_text = text;
 }
 
-// GOW3_FPS_LOG=1: presented frames per second and the worst frame, every 5 s (benchmarks).
+// GOW3_FPS_LOG=1: presented frames per second and the worst frame, every 5 s (benchmarks). The launcher
+// sets 1; 0 (extra-env.txt) turns it off for a run without periodic log lines.
 void LogPresent() {
-    static const bool fps_log = std::getenv("GOW3_FPS_LOG") != nullptr;
+    static const bool fps_log = [] {
+        const char* value = std::getenv("GOW3_FPS_LOG");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
     if (!fps_log) {
         return;
     }
@@ -1348,6 +1636,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (background_total && !loading && !menu_open) {
         BackgroundLoading();
+    }
+    if (const char* notice = Vulkan::Ue4Dlss::Notice(); notice && !menu_open) {
+        DlssNotice(notice);
     }
     if (text_entry_active) {
         TextEntryBox();

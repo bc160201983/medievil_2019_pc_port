@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <thread>
 #include <queue>
@@ -43,6 +44,19 @@ public:
     /// Refresh the known GPU tick
     void Refresh();
 
+    /// gow3: steady-clock nanoseconds (the stamps of RefreshedWithin).
+    [[nodiscard]] static u64 NowNs() noexcept {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+
+    /// gow3: whether some thread asked the GPU for its tick (Refresh, also at the end of Wait)
+    /// less than `interval_ns` ago: KnownGpuTick() is then at most that old.
+    [[nodiscard]] bool RefreshedWithin(u64 interval_ns) const noexcept {
+        return NowNs() - refreshed_ns.load(std::memory_order_relaxed) < interval_ns;
+    }
+
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
@@ -51,6 +65,7 @@ protected:
     vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.
     std::atomic<u64> gpu_tick{0};     ///< Current known GPU tick.
     std::atomic<u64> current_tick{1}; ///< Current logical tick.
+    std::atomic<u64> refreshed_ns{0}; ///< gow3: NowNs() at the end of the last Refresh.
 };
 
 } // namespace Vulkan

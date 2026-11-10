@@ -4,6 +4,9 @@
 
 /* The settings menu of the GPU library restarts through probe.c, which tests do not link. */
 void runtime_restart(void) { abort(); }
+/* The guest image lives in probe.c too: no image in tests (the UE4 hooks look for none). */
+unsigned char *runtime_image_base(void) { return NULL; }
+uint64_t runtime_image_size(void) { return 0; }
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -175,6 +178,50 @@ static void wall_time(void) {
     assert(get(NULL,NULL)==0 && get(NULL,z.value)==0);
     assert(!runtime_resolve("n88vx3C5nW8#libc",0));
 }
+/* Kept pool pages (Linux, runtime_memory.c pool_keep_locked): a range decommitted and committed
+ * again at its address gets its own bytes back; a range committed elsewhere that has to take
+ * those pages reads zero, not their bytes (the Hilltop Mausoleum's garbage lighting). With
+ * GOW3_POOL_KEEP_PAGES=0 it only prints what the old behaviour does. */
+typedef int32_t (ABI *PoolExpand)(int64_t, int64_t, uint64_t, uint64_t, int64_t *);
+typedef int32_t (ABI *PoolReserve)(void *, uint64_t, uint64_t, int, void **);
+typedef int32_t (ABI *PoolCommit)(void *, uint64_t, int, int, int);
+typedef int32_t (ABI *PoolDecommit)(void *, uint64_t, int);
+static void pool_pages(void) {
+    PoolExpand expand=GET(PoolExpand,"qCSfqDILlns#libkernel");
+    PoolReserve reserve=GET(PoolReserve,"pU-QydtGcGY#libkernel");
+    PoolCommit commit=GET(PoolCommit,"Vzl66WmfLvk#libkernel");
+    PoolDecommit decommit=GET(PoolDecommit,"LXo1tpFqJGs#libkernel");
+    const char *keep_env=getenv("GOW3_POOL_KEEP_PAGES");
+    const int keep=!(keep_env && keep_env[0]=='0');
+    const uint64_t size=65536; /* 4 pool pages of 16 KiB: the whole pool */
+    int64_t phys=-1;
+    void *base=NULL;
+    assert(expand(0,536870912,size,65536,&phys)==0);
+    assert(reserve(NULL,2*size,65536,0,&base)==0 && base);
+    unsigned char *one=base, *two=(unsigned char *)base+size;
+    /* 1. own bytes back */
+    assert(commit(one,size,0,3,0)==0);
+    for (uint64_t p=0;p<size;p+=16384) memset(one+p,0xA5,64);
+    assert(decommit(one,size,0)==0);
+    assert(commit(one,size,0,3,0)==0);
+    int own=1;
+    for (uint64_t p=0;p<size;p+=16384) own&=one[p]==0xA5 && one[p+63]==0xA5;
+    /* 2. another range on a full pool takes those pages: zero, not their bytes */
+    assert(decommit(one,size,0)==0);
+    assert(commit(two,size,0,3,0)==0);
+    int zero2=1;
+    for (uint64_t p=0;p<size;p+=16384) zero2&=two[p]==0 && two[p+63]==0;
+    /* 3. and back: the first range takes the second's pages, zero again */
+    for (uint64_t p=0;p<size;p+=16384) memset(two+p,0x5A,64);
+    assert(decommit(two,size,0)==0);
+    assert(commit(one,size,0,3,0)==0);
+    int zero1=1;
+    for (uint64_t p=0;p<size;p+=16384) zero1&=one[p]==0 && one[p+63]==0;
+    assert(decommit(one,size,0)==0);
+    printf("pool pages (kept %s): own bytes back %s, another range's bytes leaked %s / %s\n",
+           keep ? "on" : "off", own ? "yes" : "no", zero2 ? "no" : "YES", zero1 ? "no" : "YES");
+    if (keep) assert(own && zero2 && zero1);
+}
 static void direct_memory(void) {
     Allocate alloc=GET(Allocate,"rTXw65xmLIA#libkernel");
     Map map=GET(Map,"L-Q3LEjIbgA#libkernel");
@@ -201,6 +248,113 @@ static void direct_memory(void) {
     x=NULL; assert(map(&x,length,3,0,a,0)==0);
     assert(*(uint64_t *)x==0); /* released allocation does not leak previous data */
     assert(release(a,length)==0); /* release also unmaps owned mapping */
+}
+/* gow3 A1 (research/docs/impl-stage-a-decode.md): runtime_memory_copy_backing gives the bytes the
+ * locked path gives (CopySparseSerial: mapped ranges from the backing view, the rest zero), or 0;
+ * never a mix of two table states while maps and unmaps run on another thread. */
+int runtime_memory_copy_backing(uintptr_t address, void *data, uint64_t size);
+int runtime_memory_read_backing(uintptr_t address, void *data, uint64_t size);
+int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, int *mapped);
+uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
+extern uint64_t runtime_disabled_optimizations2;
+static void locked_copy(uintptr_t source, unsigned char *dest, uint64_t size) { /* gow3gpu.cpp's loop */
+    while (size) {
+        uintptr_t start=0, end=0; int mapped=0;
+        if (!runtime_memory_region(source,&start,&end,&mapped)) end=source+size;
+        const uint64_t n=size<end-source ? size : end-source;
+        if (!(mapped && runtime_memory_read_backing(source,dest,n))) memset(dest,0,n);
+        source+=n; dest+=n; size-=n;
+    }
+}
+typedef struct { void *address; int64_t phys; _Atomic int stop; _Atomic long cycles; } FlipFixture;
+static void *map_flipper(void *arg) { /* maps and unmaps one 2-page range over and over */
+    FlipFixture *f=arg;
+    Map map=GET(Map,"L-Q3LEjIbgA#libkernel");
+    Unmap unmap=GET(Unmap,"cQke9UuBQOk#libkernel");
+    while (!atomic_load(&f->stop)) {
+        void *at=f->address;
+        /* Pauses between the edits: copies land in both states and across edits. */
+        const struct timespec pause={0,(long)(50000+atomic_load(&f->cycles)%7*20000)};
+        assert(map(&at,2*16384,3,0x10,f->phys,0)==0 && at==f->address); /* MAP_FIXED */
+        nanosleep(&pause,NULL);
+        assert(unmap(f->address,2*16384)==0);
+        nanosleep(&pause,NULL);
+        atomic_fetch_add(&f->cycles,1);
+    }
+    return NULL;
+}
+static void backing_copies(void) {
+    Allocate alloc=GET(Allocate,"rTXw65xmLIA#libkernel");
+    Map map=GET(Map,"L-Q3LEjIbgA#libkernel");
+    Unmap unmap=GET(Unmap,"cQke9UuBQOk#libkernel");
+    Release release=GET(Release,"MBuItvba6z8#libkernel");
+    const uint64_t page=16384, pool=536870912;
+    int64_t a=-1, b=-1;
+    assert(alloc(0,pool,4*page,0,0,&a)==0 && alloc(0,pool,2*page,0,0,&b)==0);
+    void *x=NULL;
+    assert(map(&x,4*page,3,0,a,0)==0);
+    unsigned char *p=x;
+    for (uint64_t i=0;i<4*page;++i) p[i]=(unsigned char)(i*7+3);
+    assert(unmap(p+page,page)==0); /* a gap: reads as zero */
+    static unsigned char got[4*16384+64], want[4*16384+64];
+    const uint64_t offsets[]={0,5,page-100,page-1,page,page+1,2*page-3,3*page+17};
+    const uint64_t sizes[]={1,64,256,4096,page,2*page,3*page-17};
+    for (int round=0;round<2;++round) { /* round 1: the R1 index filled by the clamp first */
+        for (size_t o=0;o<sizeof(offsets)/sizeof(*offsets);++o)
+            for (size_t s=0;s<sizeof(sizes)/sizeof(*sizes);++s) {
+                const uint64_t off=offsets[o], n=sizes[s];
+                if (off+n>4*page) continue;
+                const uintptr_t at=(uintptr_t)p+off;
+                if (round) (void)runtime_memory_clamp(at,n);
+                memset(got,0xee,sizeof(got)); memset(want,0xdd,sizeof(want));
+                locked_copy(at,want,n);
+                assert(runtime_memory_copy_backing(at,got,n)==1);
+                assert(!memcmp(got,want,n) && got[n]==0xee);
+            }
+    }
+    /* The live switch: second toggle word 1048576 sends every copy the locked way. */
+    __atomic_or_fetch(&runtime_disabled_optimizations2,UINT64_C(1048576),__ATOMIC_RELAXED);
+    assert(runtime_memory_copy_backing((uintptr_t)p,got,64)==0);
+    __atomic_and_fetch(&runtime_disabled_optimizations2,~UINT64_C(1048576),__ATOMIC_RELAXED);
+    /* Another thread maps and unmaps b at a fixed address: each copy of that range is all its
+     * bytes or all zeros (one table state), and copies of the stable range stay exact. */
+    void *y=NULL;
+    assert(map(&y,2*page,3,0,b,0)==0);
+    for (uint64_t i=0;i<2*page;++i) ((unsigned char *)y)[i]=(unsigned char)(i*13+1);
+    static unsigned char pattern[2*16384], stable[4*16384];
+    memcpy(pattern,y,2*page);
+    assert(unmap(y,2*page)==0);
+    locked_copy((uintptr_t)p,stable,4*page);
+    FlipFixture f={y,b,0,0};
+    pthread_t flipper;
+    assert(pthread_create(&flipper,NULL,map_flipper,&f)==0);
+    long copied=0, locked=0, mapped=0, empty=0;
+    const time_t until=time(NULL)+10;
+    for (long i=0; (i<1000 || atomic_load(&f.cycles)<300) && time(NULL)<until; ++i) {
+        if (runtime_memory_copy_backing((uintptr_t)y,got,2*page)) {
+            ++copied;
+            if (!memcmp(got,pattern,2*page)) ++mapped;
+            else {
+                for (uint64_t k=0;k<2*page;++k) assert(got[k]==0);
+                ++empty;
+            }
+        } else ++locked;
+        if (runtime_memory_copy_backing((uintptr_t)p,got,4*page)) assert(!memcmp(got,stable,4*page));
+    }
+    atomic_store(&f.stop,1);
+    assert(pthread_join(flipper,NULL)==0);
+    printf("backing copies: %ld without the lock (%ld mapped, %ld unmapped), %ld the locked way, %ld map cycles\n",
+           copied,mapped,empty,locked,(long)atomic_load(&f.cycles));
+    assert(mapped>0 && empty>0 && atomic_load(&f.cycles)>0); /* both states seen without the lock */
+    /* No writer now: every copy goes without the lock (a failed copy returns at once, so the
+     * counts above are mostly fast retries while the other thread held the lock). */
+    for (int i=0;i<1000;++i) {
+        assert(runtime_memory_copy_backing((uintptr_t)y,got,2*page)==1);
+        for (uint64_t k=0;k<2*page;++k) assert(got[k]==0); /* left unmapped */
+        assert(runtime_memory_copy_backing((uintptr_t)p,got,4*page)==1 && !memcmp(got,stable,4*page));
+    }
+    assert(unmap(p,4*page)==0);
+    assert(release(a,4*page)==0 && release(b,2*page)==0);
 }
 static void memory_primitives(void) {
     typedef void *(ABI *Set)(void *,int,size_t);
@@ -326,6 +480,7 @@ static void rw_timeouts(void) {
     fixture_destroy(&f);
 }
 int main(int argc,char **argv) {
+    setenv("GOW3_BACKING_COPY","1",1); setenv("GOW3_REGION_INDEX","1",1); /* A1 test: read once, at first use */
     runtime_start(0); assert(runtime_resolve("bzQExy189ZI#libc",0)==0);
     runtime_start(1);
     assert(runtime_resolve("bzQExy189ZI#wrong#module",0)==0);
@@ -355,7 +510,10 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-lifecycle")) { rw_lifecycle(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
-    libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
+    /* A1 alone (the full run stops earlier today: posix_mutexes' destroy-while-locked check). */
+    if (argc>1 && !strcmp(argv[1],"--backing-copies")) { direct_memory(); backing_copies(); return 0; }
+    if (argc>1 && !strcmp(argv[1],"--pool-pages")) { pool_pages(); return 0; }
+    libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives(); backing_copies();
     rw_lifecycle(); rw_concurrency(); rw_timeouts();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;

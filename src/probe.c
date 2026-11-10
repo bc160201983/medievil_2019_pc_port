@@ -5,8 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
 #include "runtime.h"
 #include "orb_hook.h"
+#include "hzb_hook.h"
+#include "level_hook.h"
+#include "particle_hook.h"
 #include "cheat_hook.h"
 #include "actor_hook.h"
 #include "damage_hook.h"
@@ -16,6 +20,8 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
+#include <io.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -36,6 +42,16 @@ static uint64_t import_count;
 static unsigned char *image;
 /* The loaded game image (eboot vaddr 0), for runtime code that reads the game's own data. */
 unsigned char *runtime_image_base(void) { return image; }
+/* gow3 gate 2: GPU write faults by PS4 memory type (runtime_memory.c), with the guest code offset. */
+int runtime_fault_stats_enabled(void);
+void runtime_memory_note_gpu_fault(uintptr_t address, uint64_t guest_site);
+static void note_gpu_fault(void *address, uintptr_t rip) {
+    if (!runtime_fault_stats_enabled()) return;
+    const uintptr_t offset=rip-(uintptr_t)image;
+    runtime_memory_note_gpu_fault((uintptr_t)address,offset<0x10000000 ? offset : 0);
+}
+static uint64_t image_size;
+uint64_t runtime_image_size(void) { return image_size; }
 static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
@@ -134,6 +150,54 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     }
     snprintf(out,size,"%p",(void *)address);
 }
+/* Crash dumps (GOW3_CRASH_DUMP: 0 off, full = all memory, default = host memory without the
+ * guest's mapped section): fatal_exception ends the process inside the first-chance handler, so
+ * Windows Error Reporting never writes one. <user dir>\crashdumps, set in main. */
+static char crash_dump_dir[MAX_PATH];
+static void write_crash_dump(EXCEPTION_POINTERS *info) {
+    const char *mode=getenv("GOW3_CRASH_DUMP");
+    if (!crash_dump_dir[0] || (mode && !strcmp(mode,"0"))) return;
+    typedef BOOL (WINAPI *WriteDump)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+                                     PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+    HMODULE dbghelp=LoadLibraryA("dbghelp.dll");
+    WriteDump write_dump=dbghelp ? (WriteDump)(void *)GetProcAddress(dbghelp,"MiniDumpWriteDump") : NULL;
+    if (!write_dump) { fputs("Crash dump: dbghelp.dll unavailable\n",stderr); return; }
+    /* Private read-write memory is the host's heaps and stacks (recorded commands, GPU state);
+     * guest memory is a mapped section view and stays out unless "full". In game the memory-walking
+     * types failed with E_INVALIDARG (the address space holds placeholder reservations and mapped
+     * views): each failure falls back to a smaller type, down to stacks and threads only. */
+    const MINIDUMP_TYPE base=(MINIDUMP_TYPE)(MiniDumpWithDataSegs|MiniDumpWithHandleData|MiniDumpWithThreadInfo|
+                                             MiniDumpWithUnloadedModules);
+    MINIDUMP_TYPE types[]={
+        (MINIDUMP_TYPE)(base|MiniDumpWithPrivateReadWriteMemory|MiniDumpWithFullMemoryInfo|
+                        MiniDumpWithIndirectlyReferencedMemory),
+        (MINIDUMP_TYPE)(base|MiniDumpWithIndirectlyReferencedMemory),
+        base,
+        MiniDumpNormal,
+    };
+    if (mode && !strcmp(mode,"full")) types[0]=(MINIDUMP_TYPE)(types[0]|MiniDumpWithFullMemory);
+    CreateDirectoryA(crash_dump_dir,NULL);
+    SYSTEMTIME now; GetLocalTime(&now);
+    char path[MAX_PATH+64];
+    snprintf(path,sizeof(path),"%s\\medievil-%04u%02u%02u-%02u%02u%02u-%lu.dmp",crash_dump_dir,now.wYear,now.wMonth,
+             now.wDay,now.wHour,now.wMinute,now.wSecond,GetCurrentProcessId());
+    HANDLE file=CreateFileA(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (file==INVALID_HANDLE_VALUE) { fprintf(stderr,"Crash dump: cannot create %s (%lu)\n",path,GetLastError()); return; }
+    MINIDUMP_EXCEPTION_INFORMATION exception={GetCurrentThreadId(),info,FALSE};
+    /* Written from the faulting thread while the others run: good enough for diagnostics. */
+    for (size_t i=0;i<sizeof(types)/sizeof(types[0]);++i) {
+        SetFilePointer(file,0,NULL,FILE_BEGIN);
+        SetEndOfFile(file);
+        if (write_dump(GetCurrentProcess(),GetCurrentProcessId(),file,types[i],&exception,NULL,NULL)) {
+            CloseHandle(file);
+            fprintf(stderr,"Crash dump: %s (type 0x%x)\n",path,(unsigned)types[i]);
+            return;
+        }
+        fprintf(stderr,"Crash dump: type 0x%x failed (0x%08lx)\n",(unsigned)types[i],GetLastError());
+    }
+    CloseHandle(file);
+    DeleteFileA(path);
+}
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -192,6 +256,8 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         rbp=frame[0];
     }
     fflush(NULL);
+    write_crash_dump(info);
+    fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -200,7 +266,10 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     DWORD code=record->ExceptionCode;
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
-        if (gpu_enabled && gow3gpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+        if (gpu_enabled && gow3gpu_handle_fault(info,(void *)record->ExceptionInformation[1])) {
+            note_gpu_fault((void *)record->ExceptionInformation[1],(uintptr_t)info->ContextRecord->Rip);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
              * in gow3_longjmp, outside the exception dispatcher, back at its recovery point. */
@@ -228,6 +297,9 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
         int ours=(image && rip-(uintptr_t)image<0x20000000) ||
                  (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) && module==self) ||
                  !module;
+        /* winpthreads raises no exceptions of its own: a fault there is a bad mutex or condition
+         * handle from the runtime (S1, plan-baseline-issues.md), reported with a dump. */
+        if (!ours && module==GetModuleHandleA("libwinpthread-1.dll")) ours=1;
         if (ours) return fatal_exception(info);
     }
     /* GOW3_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
@@ -254,7 +326,10 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 #ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
-    if (gpu_enabled && sig == SIGSEGV && gow3gpu_handle_fault(context, info->si_addr)) return;
+    if (gpu_enabled && sig == SIGSEGV && gow3gpu_handle_fault(context, info->si_addr)) {
+        note_gpu_fault(info->si_addr, (uintptr_t)((ucontext_t *)context)->uc_mcontext.gregs[REG_RIP]);
+        return;
+    }
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
@@ -371,6 +446,12 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
     return 0;
 }
 extern ABI float gow3_orbs_gain(void *player, float requested);
+extern ABI void medievil_hzb_map(void *tester, void *command_list);
+extern ABI void medievil_hzb_submit(void *tester);
+extern ABI void medievil_level_change(void);
+extern ABI int medievil_particle_advance(uintptr_t fx);
+extern ABI int medievil_particle_pre_render(uintptr_t fx);
+extern void medievil_hzb_init(uintptr_t map_results, uintptr_t first_frame_buffer);
 extern void gow3_orbs_status(int supported);
 extern uintptr_t gow3_cheat_flag(unsigned id);
 extern uintptr_t gow3_actor_slots_address(void);
@@ -496,6 +577,157 @@ static void install_orb_multiplier(const char *app0, Segment *segments, uint64_t
     gow3_orbs_status(1);
     printf("Red orbs: live multiplier ready (3 validated gain paths, 0.1x to 100x)\n");
 }
+/* MediEvil HZB occlusion remap (src/hzb_hook.h, gpu/shim/medievil_hzb.cpp): opt-in,
+ * GOW3_HZB_REMAP=1, with r.HZBOcclusion=1 and occlusion queries on. */
+static int rel32_to(uint64_t at, const unsigned char *target, int32_t *out) {
+    const int64_t delta = (int64_t)(uintptr_t)target - (int64_t)(uintptr_t)(image + at + 5);
+    if (delta < INT32_MIN || delta > INT32_MAX) return 0;
+    *out = (int32_t)delta;
+    return 1;
+}
+static void install_hzb_remap(Segment *segments, uint64_t count, uint64_t size) {
+    const char *env = getenv("GOW3_HZB_REMAP");
+    if (!env || env[0] != '1') return;
+    const MedievilHzbSites *sites = medievil_hzb_find(image, size);
+    if (!sites || !mapped(segments, count, sites->call, 5) || !mapped(segments, count, sites->submit_call, 5)) {
+        printf("HZB remap: unavailable (not an analysed MediEvil eboot: 01.00 or 01.02)\n");
+        return;
+    }
+    unsigned char *stubs = allocate(page_size);
+    unsigned char *map_stub = stubs, *submit_stub = stubs + 64;
+    int32_t map_rel, submit_rel;
+    if (!rel32_to(sites->call, map_stub, &map_rel) || !rel32_to(sites->submit_call, submit_stub, &submit_rel)) {
+        printf("HZB remap: unavailable (stub outside relative-call range)\n");
+        return;
+    }
+    medievil_hzb_init((uintptr_t)(image + sites->map_results), (uintptr_t)(image + sites->first_frame_buffer));
+    medievil_hzb_build_map_stub(map_stub, (uintptr_t)medievil_hzb_map);
+    medievil_hzb_build_submit_stub(submit_stub, (uintptr_t)medievil_hzb_submit, (uintptr_t)(image + sites->submit));
+    protect(stubs, page_size, 5);
+    memcpy(image + sites->call + 1, &map_rel, 4);
+    memcpy(image + sites->submit_call + 1, &submit_rel, 4);
+    printf("HZB remap: MapResults and Submit hooks ready (game build %s; results served by occlusion history key, "
+           "no GPU wait)\n", sites == medievil_hzb_builds ? "01.00" : "01.02");
+}
+
+/* MediEvil: the movies still playing are suspended at each level change (src/level_hook.h): the
+ * game never stops its intro after the skip. GOW3_MOVIE_SUSPEND=0: off. */
+static void install_level_hook(Segment *segments, uint64_t count, uint64_t size) {
+    const char *env = getenv("GOW3_MOVIE_SUSPEND");
+    if (env && env[0] == '0') return;
+    const MedievilLevelSites *sites = medievil_level_find(image, size);
+    if (!sites || !mapped(segments, count, sites->call, 5)) {
+        printf("Movies: level-change suspend unavailable (not an analysed MediEvil eboot: 01.00 or 01.02)\n");
+        return;
+    }
+    unsigned char *stub = allocate(page_size);
+    int32_t rel;
+    if (!rel32_to(sites->call, stub, &rel)) {
+        printf("Movies: level-change suspend unavailable (stub outside relative-call range)\n");
+        return;
+    }
+    medievil_level_build_stub(stub, (uintptr_t)medievil_level_change, (uintptr_t)(image + sites->open_level));
+    protect(stub, page_size, 5);
+    memcpy(image + sites->call + 1, &rel, 4);
+    printf("Movies: playing movies are suspended at each level change (OpenLevel hook, game build %s)\n",
+           sites == medievil_level_builds ? "01.00" : "01.02");
+}
+
+/* MediEvil debug menu trace (research, plan-work-queue.md item 6): Dan's Blueprint opens the debug
+ * menu on R3 after the native GetAllowDebugMenu (01.00 works, 01.02 does not). Its exec function is
+ * wrapped through its FNameNativePtrPair slot (read when the class registers its natives, after
+ * this). Each call logs the calling Blueprint function and object (FFrame: Node 0x10, Object 0x18;
+ * UObject: ClassPrivate 0x10, NamePrivate 0x18) and the result; a caller already logged is logged
+ * again after a second. Opt-in, GOW3_DEBUG_MENU_TRACE=1. */
+typedef struct { uint32_t slot, exec; const char *build; } MedievilDebugMenuSite;
+static const MedievilDebugMenuSite medievil_debug_menu_sites[] = {
+    {0x4ed1818, 0x6639c0, "01.00"},
+    {0x4ed1818, 0x665ca0, "01.02"},
+};
+static const unsigned char medievil_debug_menu_exec_bytes[] = {
+    0x55,0x48,0x89,0xe5,0x53,0x50,0x48,0x8b,0x46,0x20,0x48,0x89,0xd3 /* push rbp .. mov rbx, rdx */
+};
+typedef ABI void (*Ue4Native)(void *context, void *stack, void *result);
+static Ue4Native debug_menu_exec;
+static int32_t ue4_name_index(const void *object) {
+    return object ? *(const int32_t *)((const char *)object + 0x18) : -1;
+}
+static ABI void debug_menu_trace(void *context, void *stack, void *result) {
+    debug_menu_exec(context, stack, result);
+    static uint64_t calls, last_ms;
+    static void *last_object;
+    static int last_result = -1;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const uint64_t ms = (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+    void *node = *(void **)((char *)stack + 0x10), *object = *(void **)((char *)stack + 0x18);
+    void *cls = object ? *(void **)((char *)object + 0x10) : NULL;
+    const int value = *(const unsigned char *)result;
+    ++calls;
+    if (object == last_object && value == last_result && ms - last_ms < 1000) return;
+    printf("Debug menu trace: GetAllowDebugMenu call %" PRIu64 " -> %d (function %p name %d, object %p "
+           "name %d, class %p name %d, context %p)\n", calls, value, node, ue4_name_index(node), object,
+           ue4_name_index(object), cls, ue4_name_index(cls), context);
+    fflush(stdout);
+    last_object = object;
+    last_result = value;
+    last_ms = ms;
+}
+static void install_debug_menu_trace(Segment *segments, uint64_t count, uint64_t size) {
+    const char *env = getenv("GOW3_DEBUG_MENU_TRACE");
+    if (!env || env[0] != '1') return;
+    for (size_t i = 0; i < sizeof(medievil_debug_menu_sites) / sizeof(medievil_debug_menu_sites[0]); ++i) {
+        const MedievilDebugMenuSite *s = &medievil_debug_menu_sites[i];
+        if (!mapped(segments, count, s->slot, 8) || size < s->exec + sizeof(medievil_debug_menu_exec_bytes) ||
+            memcmp(image + s->exec, medievil_debug_menu_exec_bytes, sizeof(medievil_debug_menu_exec_bytes)))
+            continue;
+        uint64_t slot;
+        memcpy(&slot, image + s->slot, 8);
+        if (slot != (uint64_t)(uintptr_t)(image + s->exec)) {
+            printf("Debug menu trace: unavailable (game build %s, native slot holds %#" PRIx64 ")\n", s->build, slot);
+            return;
+        }
+        debug_menu_exec = (Ue4Native)(uintptr_t)(image + s->exec);
+        const uint64_t wrapper = (uint64_t)(uintptr_t)debug_menu_trace;
+        memcpy(image + s->slot, &wrapper, 8);
+        printf("Debug menu trace: GetAllowDebugMenu wrapped (game build %s)\n", s->build);
+        return;
+    }
+    printf("Debug menu trace: unavailable (not an analysed MediEvil eboot: 01.00 or 01.02)\n");
+}
+
+/* MediEvil GPU particle flip guard (src/particle_hook.h, runtime_extra.c): opt-in,
+ * GOW3_PARTICLE_FLIP_GUARD=1; the toggle file's second word 16384 turns the guard off live. */
+static void install_particle_flip_guard(Segment *segments, uint64_t count, uint64_t size) {
+    const char *env = getenv("GOW3_PARTICLE_FLIP_GUARD");
+    if (!env || env[0] != '1') return;
+    const MedievilParticleSites *sites = medievil_particle_find(image, size);
+    if (!sites || !mapped(segments, count, sites->pre_init_jump, 5) ||
+        !mapped(segments, count, sites->pre_render_call, 5)) {
+        printf("GPU particle flip guard: unavailable (not an analysed MediEvil eboot: 01.00 or 01.02)\n");
+        return;
+    }
+    unsigned char *stubs = allocate(page_size);
+    unsigned char *advance_stub = stubs, *pre_render_stub = stubs + 64;
+    int32_t advance_rel, pre_render_rel;
+    if (!rel32_to(sites->pre_init_jump, advance_stub, &advance_rel) ||
+        !rel32_to(sites->pre_render_call, pre_render_stub, &pre_render_rel)) {
+        printf("GPU particle flip guard: unavailable (stub outside relative-jump range)\n");
+        return;
+    }
+    medievil_particle_build_advance_stub(advance_stub, (uintptr_t)medievil_particle_advance,
+                                         (uintptr_t)(image + sites->advance));
+    medievil_particle_build_pre_render_stub(pre_render_stub, (uintptr_t)medievil_particle_pre_render,
+                                            (uintptr_t)(image + sites->advance),
+                                            (uintptr_t)(image + sites->multi_gpu));
+    protect(stubs, page_size, 5);
+    memcpy(image + sites->pre_init_jump + 1, &advance_rel, 4);
+    memcpy(image + sites->pre_render_call + 1, &pre_render_rel, 4);
+    printf("GPU particle flip guard: PreInitViews and PreRender hooks ready (game build %s; one state flip per "
+           "simulation; toggle file second word 16384: guard off)\n",
+           sites == medievil_particle_builds ? "01.00" : "01.02");
+}
+
 /* Writes a jump from image+at to `stub`; the rest of the replaced bytes become nops (the stub
  * replays them). 0 when the stub is out of relative-jump range. */
 static int install_jump(uint64_t at, unsigned length, unsigned char *stub) {
@@ -614,6 +846,17 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef _WIN32
+    /* GOW3_STDOUT_FILE: stdout and stderr into this file, for launches whose console goes nowhere
+     * (Nsight Graphics' ngfx: the crash report would otherwise be lost). */
+    const char *stdout_file=getenv("GOW3_STDOUT_FILE");
+    if (stdout_file && *stdout_file && freopen(stdout_file,"w",stdout)) {
+        setvbuf(stdout,NULL,_IONBF,0);
+        _dup2(_fileno(stdout),_fileno(stderr));
+        SetStdHandle(STD_OUTPUT_HANDLE,(HANDLE)_get_osfhandle(_fileno(stdout)));
+        SetStdHandle(STD_ERROR_HANDLE,(HANDLE)_get_osfhandle(_fileno(stderr)));
+    }
+#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -668,6 +911,7 @@ int main(int argc, char **argv) {
     gow3gpu_register_kernel();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
+    snprintf(crash_dump_dir,sizeof(crash_dump_dir),"%s\\crashdumps",user_dir ? user_dir : "user");
     AddVectoredExceptionHandler(1, vectored_fault);
     SetUnhandledExceptionFilter(unhandled_fault);
     runtime_host_scheduling_init();
@@ -856,6 +1100,7 @@ int main(int argc, char **argv) {
         _exit(missing ? 1 : 0); /* no destructors: GPU threads are running */
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    image_size = size;
     /* AMD-only SSE4a instructions in the game: SSE2 trampolines on CPUs without them. */
     unsigned char *sse4a_stubs = allocate(page_size);
     runtime_sse4a_install(image, size, sse4a_stubs, page_size);
@@ -869,6 +1114,10 @@ int main(int argc, char **argv) {
     if (game_hooks) install_cheats(app0, segments, ns, size);
     if (game_hooks) install_actor_watch(app0, segments, ns, size);
     if (game_hooks) install_stat_multipliers(app0, segments, ns, size);
+    if (gpu_enabled) install_hzb_remap(segments, ns, size);
+    if (gpu_enabled) install_level_hook(segments, ns, size);
+    if (gpu_enabled) install_debug_menu_trace(segments, ns, size);
+    if (gpu_enabled) install_particle_flip_guard(segments, ns, size);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif

@@ -1,9 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <stop_token>
+#include <thread>
 #include "gow3_toggles.h"
 #include <ranges>
 #include "common/assert.h"
+#include "common/thread.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -126,17 +133,99 @@ const char* DescribeImageHandle(VkImage image) {
     return "";
 }
 
-UniqueImage::~UniqueImage() {
-    if (image) {
-        NoteImage(image, true);
-        vmaDestroyImage(allocator, image, allocation);
+namespace {
+// gow3: image memory is released on its own thread. Freeing an image can free a whole VMA block
+// (vkFreeMemory), a kernel call that takes the GPU driver's lock; on the draw recording thread a
+// GPU monitor's polling (MSI Afterburner's NVAPI escapes) held it up to 33 ms (research:
+// plan-frame-pacing.md, "CPU oscillation", trace cpu-osc-1). An image is only destroyed once the
+// GPU is done with it, so destroying it a little later is safe. GOW3_IMAGE_RELEASE_THREAD=0: inline.
+class ImageReleaser {
+public:
+    static ImageReleaser& Get() {
+        static ImageReleaser releaser;
+        return releaser;
     }
+
+    bool Enabled() const {
+        return enabled;
+    }
+
+    void Release(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+        {
+            std::scoped_lock lock{mutex};
+            items.push_back({allocator, image, allocation});
+            if (!worker.joinable()) {
+                worker = std::jthread([this](std::stop_token stop) { Run(stop); });
+            }
+        }
+        work_cv.notify_one();
+    }
+
+    /// Returns once every queued image is destroyed.
+    void Drain() {
+        std::unique_lock lock{mutex};
+        idle_cv.wait(lock, [this] { return items.empty() && !busy; });
+    }
+
+private:
+    struct Item {
+        VmaAllocator allocator;
+        VkImage image;
+        VmaAllocation allocation;
+    };
+
+    ImageReleaser() {
+        const char* env = std::getenv("GOW3_IMAGE_RELEASE_THREAD");
+        enabled = !env || env[0] != '0';
+    }
+
+    void Run(std::stop_token stop) {
+        Common::SetCurrentThreadName("gow3:ImageRelease");
+        std::unique_lock lock{mutex};
+        while (true) {
+            work_cv.wait(lock, stop, [this] { return !items.empty(); });
+            if (items.empty()) {
+                return; // stop requested
+            }
+            const Item item = items.front();
+            items.pop_front();
+            busy = true;
+            lock.unlock();
+            vmaDestroyImage(item.allocator, item.image, item.allocation);
+            lock.lock();
+            busy = false;
+            if (items.empty()) {
+                idle_cv.notify_all();
+            }
+        }
+    }
+
+    bool enabled = true;
+    std::mutex mutex;
+    std::condition_variable_any work_cv;
+    std::condition_variable_any idle_cv;
+    std::deque<Item> items;
+    bool busy = false;
+    std::jthread worker;
+};
+} // namespace
+
+void DrainImageReleases() {
+    ImageReleaser::Get().Drain();
+}
+
+UniqueImage::~UniqueImage() {
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
     if (image) {
         NoteImage(image, true);
-        vmaDestroyImage(allocator, image, allocation);
+        if (ImageReleaser::Get().Enabled()) {
+            ImageReleaser::Get().Release(allocator, image, allocation);
+        } else {
+            vmaDestroyImage(allocator, image, allocation);
+        }
         image = vk::Image{};
         allocation = {};
     }
@@ -315,6 +404,12 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     if (!created) {
         result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
                                 &alloc_info);
+        if (result != VK_SUCCESS && ImageReleaser::Get().Enabled()) {
+            // Within budget only: the images still queued for release may hold the memory.
+            DrainImageReleases();
+            result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                    &alloc_info);
+        }
     }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
@@ -449,6 +544,52 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
+// gow3 GOW3_SKIP_READ_BARRIERS=1: a read after a read in the same layout needs no barrier (no
+// hazard). The reads are merged into the tracked state instead, so the next real barrier (a
+// write or a layout change) waits for all of them. T-F2: the kills' effects put ~36k barriers a
+// 5 s window between depth-test reads and shader reads of the depth buffer in one read-only
+// layout, each ending and reopening the render pass.
+static bool SkipReadBarriers() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GOW3_SKIP_READ_BARRIERS");
+        return !(env && env[0] == '0'); // default on (launcher: perf_lean_barriers)
+    }();
+    return enabled;
+}
+
+// gow3 GOW3_NARROW_IMAGE_STAGES: a sampled image's stored stage is now the shader stages that read
+// it, not all commands. A read by another kind of shader (compute after graphics, or back) is
+// outside the earlier barrier's scope, so it gets its own read-after-read barrier, which chains
+// onto that one. Stored stages that are not only shader stages (depth tests, attachments, all
+// commands) skip as before (T-F2).
+static bool ReadCovered(vk::PipelineStageFlags2 have, vk::PipelineStageFlags2 want) {
+    using S = vk::PipelineStageFlagBits2;
+    constexpr vk::PipelineStageFlags2 pre_raster =
+        S::eVertexShader | S::eTessellationControlShader | S::eTessellationEvaluationShader |
+        S::eGeometryShader;
+    constexpr vk::PipelineStageFlags2 shaders =
+        pre_raster | S::ePreRasterizationShaders | S::eFragmentShader | S::eComputeShader;
+    if (have & ~shaders) {
+        return true;
+    }
+    if (have & S::ePreRasterizationShaders) {
+        have |= pre_raster;
+    }
+    if (want & S::ePreRasterizationShaders) {
+        want = (want & ~vk::PipelineStageFlags2{S::ePreRasterizationShaders}) | pre_raster;
+    }
+    return !(want & ~have);
+}
+
+static bool IsReadOnly(vk::AccessFlags2 access) {
+    constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+                            vk::AccessFlagBits2::eColorAttachmentWrite |
+                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                            vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eHostWrite |
+                            vk::AccessFlagBits2::eMemoryWrite;
+    return !(access & writes);
+}
+
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
@@ -460,6 +601,12 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     }
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
+    // gow3: a 3D image has one array layer; the layers of a 2D array view of it are depth
+    // slices, which a barrier cannot select (Vulkan: layer 0, count 1), so it covers the volume.
+    if (subres_range && info.props.is_volume) {
+        subres_range->base.layer = 0;
+        subres_range->extent.layers = 1;
+    }
 
     const bool needs_partial_transition =
         subres_range &&
@@ -507,7 +654,20 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                              vk::AccessFlagBits2::eShaderWrite |
                                              vk::AccessFlagBits2::eMemoryWrite;
                 const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
+                if (SkipReadBarriers() && state.layout == dst_layout &&
+                    IsReadOnly(state.access_mask) && IsReadOnly(dst_mask) &&
+                    ReadCovered(state.pl_stage, dst_stage)) {
+                    state.access_mask |= dst_mask;
+                    state.pl_stage |= dst_stage;
+                    continue;
+                }
+                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write ||
+                    !ReadCovered(state.pl_stage, dst_stage)) {
+                    // A read after a read keeps the earlier readers: a later write waits for all.
+                    const auto keep_stages =
+                        state.layout == dst_layout && IsReadOnly(state.access_mask) && IsReadOnly(dst_mask)
+                            ? state.pl_stage
+                            : vk::PipelineStageFlags2{};
                     if (merge && barriers.size() > first_barrier) {
                         auto& last = barriers.back();
                         auto& range = last.subresourceRange;
@@ -518,7 +678,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                             ++range.layerCount;
                             state.layout = dst_layout;
                             state.access_mask = dst_mask;
-                            state.pl_stage = dst_stage;
+                            state.pl_stage = keep_stages | dst_stage;
                             continue;
                         }
                     }
@@ -542,7 +702,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                     });
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
-                    state.pl_stage = dst_stage;
+                    state.pl_stage = keep_stages | dst_stage;
                 }
             }
         }
@@ -555,9 +715,22 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                      vk::AccessFlagBits2::eShaderWrite |
                                      vk::AccessFlagBits2::eMemoryWrite;
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write &&
+            ReadCovered(last_state.pl_stage, dst_stage)) {
             return;
         }
+        if (SkipReadBarriers() && last_state.layout == dst_layout &&
+            IsReadOnly(last_state.access_mask) && IsReadOnly(dst_mask) &&
+            ReadCovered(last_state.pl_stage, dst_stage)) {
+            last_state.access_mask |= dst_mask;
+            last_state.pl_stage |= dst_stage;
+            return;
+        }
+        // A read after a read keeps the earlier readers: a later write waits for all.
+        const auto keep_stages = last_state.layout == dst_layout && IsReadOnly(last_state.access_mask) &&
+                                         IsReadOnly(dst_mask)
+                                     ? last_state.pl_stage
+                                     : vk::PipelineStageFlags2{};
 
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
@@ -577,6 +750,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         });
+        last_state.layout = dst_layout;
+        last_state.access_mask = dst_mask;
+        last_state.pl_stage = keep_stages | dst_stage;
+        return;
     }
 
     last_state.layout = dst_layout;

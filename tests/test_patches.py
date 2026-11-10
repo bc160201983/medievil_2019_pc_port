@@ -92,6 +92,17 @@ class GameProfileTests(unittest.TestCase):
         self.assertEqual(patch_requirements(GOW3, ['Frame Rate Patch - 120 FPS'], '01.02'), (None, 120))
         self.assertEqual(patch_requirements(GOW3, [], '01.02'), (None, None))
 
+    def test_sized_boot_patch(self):
+        # "Boot display size WxH" fills the entry's Type="size" lines with W and H (int32 LE).
+        medievil = ROOT / 'patches' / 'MediEvil.xml'
+        writes = compile_patches(medievil, ['Boot display size 2560x1440'], '01.00', [(0, 1 << 40)])
+        self.assertEqual([(offset + 0x400000, data.hex()) for offset, data in writes],
+                         [(0x40be758, '000a0000a0050000'), (0x40be7b8, '000a0000a0050000')])
+        with self.assertRaises(ValueError):
+            compile_patches(medievil, ['Boot display size'], '01.00', [(0, 1 << 40)])
+        with self.assertRaises(ValueError):
+            compile_patches(medievil, ['Native 4K framebuffer pool (512 MB) 1x1'], '01.00', [(0, 1 << 40)])
+
 
 if __name__ == '__main__':
     unittest.main()

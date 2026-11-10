@@ -15,9 +15,25 @@ inline constexpr std::array<std::string_view, DisplayModeCount> DisplayModeKeys 
 inline constexpr std::array<const char*, DisplayModeCount> DisplayModeNames = {
     "Windowed", "Borderless", "Fullscreen"};
 
-/// Present rate limits; 0 = unlimited.
+/// Present rate limits; 0 = unlimited. Negative: from the display refresh (ResolveFpsLimit).
 /// -1: half the display refresh (each frame shows for exactly two refreshes: even pacing).
-inline constexpr std::array<int, 6> FpsLimits = {30, 60, 120, 240, 0, -1};
+/// -2: with VRR (G-Sync / FreeSync) below the refresh by NVIDIA Reflex's rule, refresh -
+///     refresh^2 / 3600 (its automatic caps: 116 at 120 Hz, 138 at 144, 171 at 180, 225 at 240);
+///     on a fixed-refresh display the refresh itself.
+/// -3: with VRR one under half the refresh (119 at 240 Hz: at exactly 120 the VRR display
+///     flickered, T-F19 / T-F27); on a fixed-refresh display exactly half (each frame two
+///     refreshes). 119 / 141 / 237: fixed values for VRR on 240 and 144 Hz displays.
+inline constexpr std::array<int, 11> FpsLimits = {-2, -3, 30, 60, 119, 120, 141, 237, 240, 0, -1};
+/// The limit in FPS of a FpsLimits value (or any 20-1000) on a `refresh` Hz display, with or
+/// without VRR (Gow3Settings::display_vrr); 0: none.
+inline int ResolveFpsLimit(int value, unsigned refresh, bool vrr = true) {
+    switch (value) {
+    case -1: return int(refresh / 2);
+    case -2: return int(refresh) - (vrr ? int(refresh * refresh / 3600) : 0);
+    case -3: return int(refresh / 2) - (vrr ? 1 : 0);
+    default: return value < 0 ? 0 : value;
+    }
+}
 
 /// Game patch suffixes ("Resolution Patch - <name>"); "native" is no resolution patch.
 /// Unreal Engine 4 (MediEvil): the scene scale; the *_native ones change the game's output size.
@@ -38,9 +54,9 @@ constexpr int IndexOf(const std::array<T, N>& values, const T& value, int fallba
 inline int ParseDisplayMode(std::string_view text) {
     return IndexOf(DisplayModeKeys, text, Windowed);
 }
-/// A listed limit, else unlimited.
+/// A listed limit, or any limit from 20 to 1000 FPS (medievil.ini); else unlimited.
 inline int ParseFpsLimit(int value) {
-    return IndexOf(FpsLimits, value, -1) >= 0 ? value : 0;
+    return IndexOf(FpsLimits, value, -1) >= 0 || (value >= 20 && value <= 1000) ? value : 0;
 }
 /// Index into Resolutions; unknown text is native.
 inline int ParseResolution(std::string_view text) {

@@ -118,7 +118,15 @@ static ABI int32_t ef_poll(EventFlag *handle, uint64_t bits, uint32_t mode, uint
     pthread_mutex_unlock(&f->lock);
     return r;
 }
+static int32_t ef_wait_impl(EventFlag *handle, uint64_t bits, uint32_t mode, uint64_t *result, uint32_t *timeout_us);
 static ABI int32_t ef_wait(EventFlag *handle, uint64_t bits, uint32_t mode, uint64_t *result, uint32_t *timeout_us) {
+    const uint64_t requested=timeout_us ? (uint64_t)*timeout_us*1000 : 0;
+    RUNTIME_WAIT_BEGIN();
+    const int32_t r=ef_wait_impl(handle,bits,mode,result,timeout_us);
+    RUNTIME_WAIT_END(8, requested);
+    return r;
+}
+static int32_t ef_wait_impl(EventFlag *handle, uint64_t bits, uint32_t mode, uint64_t *result, uint32_t *timeout_us) {
     EventFlag *f=flag(handle);
     if (!f) return ERR(E_SRCH);
     if (!bits || !ef_valid_mode(mode)) return ERR(E_INVAL);
@@ -166,11 +174,26 @@ static ABI int32_t is_neo_mode(void) {
     return neo;
 }
 static ABI int32_t get_cpumode(void) { return 0; }        /* SCE_KERNEL_CPUMODE_6CPU */
+/* gow3 GOW3_FRAME_STATS ("Thread ids" line, gpu driver.cpp): scePthreadGetthreadid calls and
+ * the ones that asked the kernel (atomic). */
+uint64_t runtime_thread_id_calls, runtime_thread_id_lookups;
+int runtime_fault_stats_enabled(void);
 static ABI int32_t thread_id(void) {
+    const int stats=runtime_fault_stats_enabled();
+    if (stats) __atomic_fetch_add(&runtime_thread_id_calls,1,__ATOMIC_RELAXED);
 #ifdef _WIN32
-    return (int32_t)GetCurrentThreadId();
+    (void)stats;
+    return (int32_t)GetCurrentThreadId(); /* a read of the thread block, no system call */
 #else
-    return (int32_t)syscall(SYS_gettid);
+    /* gow3 (spacepepperoni/medievil_ps4_Linux 1232650, impl-deck-cpu-bundle.md D2): UE4 asks
+     * for it on every IsInRenderingThread()-style check (~150,000 calls in 4 s on its render
+     * thread), and gettid is a system call each time. A thread's id never changes: cached. */
+    static __thread int32_t id;
+    if (!id) {
+        id=(int32_t)syscall(SYS_gettid);
+        if (stats) __atomic_fetch_add(&runtime_thread_id_lookups,1,__ATOMIC_RELAXED);
+    }
+    return id;
 #endif
 }
 static ABI int32_t thread_name(void *thread, char *name) {
@@ -196,6 +219,7 @@ static ABI int32_t prt_aperture(int index, void **address, uint64_t *size) {
 }
 static ABI int32_t kernel_nanosleep(const struct timespec *request, struct timespec *remain) {
     if (!request) return ERR(E_INVAL);
+    RUNTIME_WAIT_BEGIN();
 #ifdef _WIN32
     compat_sleep_ns((uint64_t)request->tv_sec*1000000000u+(uint64_t)request->tv_nsec);
 #else
@@ -203,6 +227,7 @@ static ABI int32_t kernel_nanosleep(const struct timespec *request, struct times
     struct timespec left=*request;
     while (nanosleep(&left,&left) && errno==EINTR) {}
 #endif
+    RUNTIME_WAIT_END(4, (uint64_t)request->tv_sec*1000000000u+(uint64_t)request->tv_nsec);
     if (remain) remain->tv_sec=remain->tv_nsec=0;
     return 0;
 }
@@ -580,28 +605,186 @@ static uintptr_t ue4_setres_slot(void) {
     }
     return slot;
 }
-/* Sets r.SetRes on the calling (game) thread; 0 when the game's variable is not where expected. */
-static int ue4_setres(const char *text) {
+/* Sets a console variable on the calling (game) thread through `slot`, the image offset of its
+ * IConsoleVariable* (a TAutoConsoleVariable's +8); 0 when the variable is not where expected. */
+static int ue4_set_cvar(uintptr_t slot, const char *name, const char *text) {
     uint16_t value[24];
     size_t n=strlen(text);
     if (!n || n>=sizeof(value)/sizeof(value[0])) return 0;
     for (size_t i=0;i<=n;++i) value[i]=(uint16_t)(unsigned char)text[i];
     unsigned char *image=runtime_image_base();
-    const uintptr_t slot=ue4_setres_slot();
     if (!image || !slot) return 0;
     const uintptr_t lo=(uintptr_t)image, hi=lo+0x6000000;
     uintptr_t cvar=*(const uintptr_t *)(image+slot);
-    if (!cvar) { printf("Native output: r.SetRes not found\n"); return 0; }
+    if (!cvar) { printf("UE4: %s not found\n",name); return 0; }
     uintptr_t vtable=*(const uintptr_t *)cvar;
-    if (vtable<lo || vtable>=hi) { printf("Native output: unexpected r.SetRes object\n"); return 0; }
+    if (vtable<lo || vtable>=hi) { printf("UE4: unexpected %s object\n",name); return 0; }
     typedef uint32_t (ABI *GetFlags)(uintptr_t);
     typedef void (ABI *Set)(uintptr_t, const uint16_t *, uint32_t);
     uintptr_t get_flags=*(const uintptr_t *)(vtable+0x20), set=*(const uintptr_t *)(vtable+0x68);
-    if (get_flags<lo || get_flags>=hi || set<lo || set>=hi) { printf("Native output: unexpected r.SetRes methods\n"); return 0; }
+    if (get_flags<lo || get_flags>=hi || set<lo || set>=hi) { printf("UE4: unexpected %s methods\n",name); return 0; }
     uint32_t flags=((GetFlags)get_flags)(cvar)&0xff000000u;
     ((Set)set)(cvar,value,flags);
-    printf("Native output: r.SetRes %s (live resolution change)\n",text);
+    printf("UE4: %s %s (live)\n",name,text);
     return 1;
+}
+static int ue4_setres(const char *text) {
+    const uintptr_t slot=ue4_setres_slot();
+    return slot ? ue4_set_cvar(slot,"r.SetRes",text) : 0;
+}
+
+/* Console variables the in-game menu switches live, set on the next game-thread poll as r.SetRes
+ * is. Per game build: {01.00, 01.02} (CUSA11227; research/docs/plan-0102.md). r.Shadow.Preshadows:
+ * registered at 0x1611700, TAutoConsoleVariable at 0x5bcff28 (found as r.SetRes's 0x5c28320 is: the
+ * lea of its name, the object beside it). The build whose registration bytes match is used. */
+typedef struct { uintptr_t object, site; unsigned char code[7]; } Ue4CvarSite;
+static const struct { const char *name; Ue4CvarSite at[2]; } ue4_cvars[]={
+    /* site: lea rsi, [rip+name] in its registration */
+    {"r.Shadow.Preshadows",{{0x5bcff28,0x1611700,{0x48,0x8d,0x35,0x1f,0x76,0x74,0x02}},{0x5bcff68,0x1614380,{0x48,0x8d,0x35,0x9f,0x7d,0x74,0x02}}}},
+    /* Effects resolution; registered at 0x16651ee (0x145d993 only looks it up and keeps its data) */
+    {"r.SeparateTranslucencyScreenPercentage",{{0x5bd2d68,0x16651ee,{0x48,0x8d,0x35,0x3d,0x8c,0x6f,0x02}},{0x5bd2da8,0x1667e6e,{0x48,0x8d,0x35,0xbd,0x93,0x6f,0x02}}}},
+    /* Render scale (gow3_settings.cpp RequestRenderScale): the upsampling switch before the
+     * percentage, as one poll sets them in this order. Objects from the registrations' own
+     * `mov [object+8], rax` (research/docs/impl-live-render-scale.md). */
+    {"r.TemporalAA.Upsampling",{{0x5c1a120,0x25662e6,{0x48,0x8d,0x35,0xbd,0x63,0x8d,0x01}},{0x5c1a160,0x25690b6,{0x48,0x8d,0x35,0x6d,0x66,0x8d,0x01}}}},
+    {"r.ScreenPercentage",{{0x581a048,0x732124,{0x48,0x8d,0x35,0x27,0x56,0x53,0x03}},{0x581a068,0x734ce4,{0x48,0x8d,0x35,0xc7,0x5f,0x53,0x03}}}},
+    /* The in-game menu's live graphics options (gow3_settings.h UE4LiveOptions); objects and sites
+     * from research/docs/study-live-switches.md, each site's lea checked to load the cvar's name. */
+    {"r.Shadow.MinResolution",{{0x5bd0068,0x1611cac,{0x48,0x8d,0x35,0x4f,0x7b,0x74,0x02}},{0x5bd00a8,0x161492c,{0x48,0x8d,0x35,0xcf,0x82,0x74,0x02}}}},
+    {"r.Shadow.MaxResolution",{{0x581a210,0x7328e6,{0x48,0x8d,0x35,0x79,0x69,0x53,0x03}},{0x581a230,0x7354a6,{0x48,0x8d,0x35,0x19,0x73,0x53,0x03}}}},
+    {"r.Shadow.DistanceScale",{{0x581a3c0,0x733053,{0x48,0x8d,0x35,0xfc,0x7e,0x53,0x03}},{0x581a3e0,0x735c13,{0x48,0x8d,0x35,0x9c,0x88,0x53,0x03}}}},
+    {"r.Shadow.CSM.MaxCascades",{{0x5bc82a8,0x1586344,{0x48,0x8d,0x35,0xc7,0x88,0x7c,0x02}},{0x5bc82e8,0x1588fc4,{0x48,0x8d,0x35,0x47,0x90,0x7c,0x02}}}},
+    {"r.ShadowQuality",{{0x5819f88,0x731dda,{0x48,0x8d,0x35,0xfd,0x46,0x53,0x03}},{0x5819fa8,0x73499a,{0x48,0x8d,0x35,0x9d,0x50,0x53,0x03}}}},
+    {"r.ViewDistanceScale",{{0x581a2d0,0x732c2d,{0x48,0x8d,0x35,0x7e,0x73,0x53,0x03}},{0x581a2f0,0x7357ed,{0x48,0x8d,0x35,0x1e,0x7d,0x53,0x03}}}},
+    {"r.StaticMeshLODDistanceScale",{{0x5bc8ef8,0x160d78a,{0x48,0x8d,0x35,0xe1,0x60,0x74,0x02}},{0x5bc8f38,0x161040a,{0x48,0x8d,0x35,0x61,0x68,0x74,0x02}}}},
+    {"foliage.LODDistanceScale",{{0x5c0a180,0x2119693,{0x48,0x8d,0x35,0xaa,0xe7,0xce,0x01}},{0x5c0a1c0,0x211c423,{0x48,0x8d,0x35,0xfa,0xea,0xce,0x01}}}},
+    {"r.AmbientOcclusionLevels",{{0x5b533c8,0x114b2cd,{0x48,0x8d,0x35,0x84,0x38,0xbb,0x02}},{0x5b53408,0x114df4d,{0x48,0x8d,0x35,0x04,0x40,0xbb,0x02}}}},
+    {"r.SSR.Quality",{{0x5bc0228,0x14f84d3,{0x48,0x8d,0x35,0x0c,0xf2,0x84,0x02}},{0x5bc0268,0x14fb153,{0x48,0x8d,0x35,0x8c,0xf9,0x84,0x02}}}},
+    {"r.VolumetricFog",{{0x5bd3bb0,0x1665ee2,{0x48,0x8d,0x35,0x0b,0x9f,0x6f,0x02}},{0x5bd3bf0,0x1668b62,{0x48,0x8d,0x35,0x8b,0xa6,0x6f,0x02}}}},
+    {"r.MotionBlurQuality",{{0x5819fa0,0x731e43,{0x48,0x8d,0x35,0xb6,0x47,0x53,0x03}},{0x5819fc0,0x734a03,{0x48,0x8d,0x35,0x56,0x51,0x53,0x03}}}},
+    {"r.DepthOfFieldQuality",{{0x581a030,0x7320b3,{0x48,0x8d,0x35,0x7c,0x53,0x53,0x03}},{0x581a050,0x734c73,{0x48,0x8d,0x35,0x1c,0x5d,0x53,0x03}}}},
+    {"r.BloomQuality",{{0x5819f28,0x731c33,{0x48,0x8d,0x35,0x18,0x42,0x53,0x03}},{0x5819f48,0x7347f3,{0x48,0x8d,0x35,0xb8,0x4b,0x53,0x03}}}},
+    {"r.LensFlareQuality",{{0x5819f10,0x731bca,{0x48,0x8d,0x35,0x43,0x41,0x53,0x03}},{0x5819f30,0x73478a,{0x48,0x8d,0x35,0xe3,0x4a,0x53,0x03}}}},
+    {"r.SceneColorFringeQuality",{{0x5819f40,0x731c9c,{0x48,0x8d,0x35,0x3d,0x44,0x53,0x03}},{0x5819f60,0x73485c,{0x48,0x8d,0x35,0xdd,0x4d,0x53,0x03}}}},
+    /* Single GPU particle pass (ue4_particle_pass_poll). TAutoConsoleVariable<float>, flags 0, default
+     * 1/30 (vmovss of 0x3d088889 just before the site); the registration stores its result at
+     * object+8 (01.00 0x5c14d20, 01.02 0x5c14d60). */
+    {"r.GPUParticle.FixDeltaSeconds",{{0x5c14d18,0x23933b3,{0x48,0x8d,0x35,0xc0,0x16,0xa9,0x01}},{0x5c14d58,0x2396183,{0x48,0x8d,0x35,0xb0,0x19,0xa9,0x01}}}},
+};
+#define UE4_CVARS (sizeof(ue4_cvars)/sizeof(ue4_cvars[0]))
+static char ue4_cvar_values[UE4_CVARS][16];
+static int ue4_cvar_pending[UE4_CVARS];
+void runtime_ue4_request_cvar(const char *name, const char *value) {
+    if (!name || !value || strlen(value)>=sizeof(ue4_cvar_values[0])) return;
+    for (size_t i=0;i<UE4_CVARS;++i) {
+        if (strcmp(ue4_cvars[i].name,name)) continue;
+        strcpy(ue4_cvar_values[i],value);
+        __atomic_store_n(&ue4_cvar_pending[i],1,__ATOMIC_RELEASE);
+    }
+}
+
+/* The single GPU particle pass (perf_particle_single_pass): r.GPUParticle.FixDeltaSeconds 0, one
+ * simulation pass a frame with the real frame time, or the game's fixed 1/30 s step, which adds a
+ * second, empty pass in some frames (~190 draws; research/docs/study-heavy-frame-map.md H3) but
+ * keeps lone torches and the crypt ember right (plan-0102.md T-0102-4). The override pak sets the
+ * start value (run.py: 0 unless GOW3_PARTICLE_FIXED_STEP=1); after that two switches decide it
+ * live, at the game-thread poll: the toggle file's second word bit 8192 (Gow3Toggle2::
+ * ParticleFixedStep) forces the fixed step whatever the menu says, and with the bit clear the
+ * menu's choice (runtime_ue4_particle_single_pass) holds. The menu keeps its own choice while the
+ * bit is set and gets it back when the bit clears. */
+#define TOGGLE2_PARTICLE_FIXED_STEP UINT64_C(8192)
+/* 1/30 as the game registers it (float 0x3d088889 in 01.00 and 01.02): 0.0333333 would be 9 ulps off. */
+#define PARTICLE_FIXED_STEP "0.033333335"
+extern uint64_t runtime_disabled_optimizations2; /* runtime_memory.c: the toggle file's second word */
+static int particle_wanted=-1; /* the menu's choice: 1 single pass, 0 fixed step, -1 not drawn yet */
+void runtime_ue4_particle_single_pass(int on) {
+    __atomic_store_n(&particle_wanted,on ? 1 : 0,__ATOMIC_RELEASE);
+}
+static void ue4_particle_pass_poll(void) {
+    static int start=-1, applied; /* the override pak's value; what the cvar holds now */
+    if (start<0) {
+        const char *fixed=getenv("GOW3_PARTICLE_FIXED_STEP");
+        applied=start=!(fixed && !strcmp(fixed,"1"));
+    }
+    int wanted=__atomic_load_n(&particle_wanted,__ATOMIC_ACQUIRE);
+    if (wanted<0) wanted=start; /* menu not opened yet: the ini's choice, as the game started */
+    const int forced=(__atomic_load_n(&runtime_disabled_optimizations2,__ATOMIC_RELAXED)&TOGGLE2_PARTICLE_FIXED_STEP)!=0;
+    const int on=forced ? 0 : wanted;
+    if (on==applied) return;
+    applied=on; /* once per switch, also when this eboot has no known address (logged once) */
+    printf("Particle single pass: %s (live%s)\n",on ? "on" : "off",forced ? ", toggle file second word 8192" : "");
+    runtime_ue4_request_cvar("r.GPUParticle.FixDeltaSeconds",on ? "0" : PARTICLE_FIXED_STEP);
+}
+
+/* GPU particle flip guard (src/particle_hook.h, installed by probe.c with
+ * GOW3_PARTICLE_FLIP_GUARD=1): one state flip per main-phase simulation, so the single pass
+ * never reads a pair older than the last simulation's output (research/docs/
+ * study-particle-fixed-step.md). Both helpers run on the render thread (FSceneRenderer). The
+ * toggle file's second word bit 16384 (Gow3Toggle2::ParticleFlipGuardOff) turns the guard off
+ * live: the hooks then only count. Every 1,200 simulations a line gives the flips and
+ * simulations since the previous line and the unpaired ones: a flip with no simulation since the
+ * previous flip, a simulation with no flip since the previous simulation. */
+#define TOGGLE2_PARTICLE_FLIP_GUARD_OFF UINT64_C(16384)
+#define PARTICLE_FX_SLOTS 8
+static struct { uintptr_t fx; int simulated; } particle_fx[PARTICLE_FX_SLOTS];
+static uint64_t particle_flips, particle_sims, particle_lone_flips, particle_lone_sims;
+static int particle_slot(uintptr_t fx) {
+    for (int i=0;i<PARTICLE_FX_SLOTS;++i) {
+        if (particle_fx[i].fx==fx) return i;
+        if (!particle_fx[i].fx) { particle_fx[i].fx=fx; return i; }
+    }
+    return -1; /* more FX systems than slots: no guard for this one */
+}
+static int particle_guard_on(void) {
+    return !(__atomic_load_n(&runtime_disabled_optimizations2,__ATOMIC_RELAXED)&TOGGLE2_PARTICLE_FLIP_GUARD_OFF);
+}
+static void particle_guard_report(void) {
+    static int last_on=-1, quiet=-1;
+    const int on=particle_guard_on();
+    if (particle_sims<1200 && on==last_on) return;
+    if (quiet<0) { /* GOW3_FPS_LOG=0: no periodic log lines (gow3_overlay.cpp LogPresent); a switch still prints */
+        const char *fps_log=getenv("GOW3_FPS_LOG");
+        quiet=fps_log && !strcmp(fps_log,"0");
+    }
+    if (quiet && on==last_on) {
+        particle_flips=particle_sims=particle_lone_flips=particle_lone_sims=0;
+        return;
+    }
+    printf("GPU particle flips: %llu flips, %llu simulations; %llu flips without a simulation (%s), "
+           "%llu simulations without a flip (%s); guard %s\n",
+           (unsigned long long)particle_flips,(unsigned long long)particle_sims,
+           (unsigned long long)particle_lone_flips,on ? "skipped" : "kept",
+           (unsigned long long)particle_lone_sims,on ? "flip added" : "none added",
+           on ? "on" : "off (toggle file second word 16384)");
+    last_on=on;
+    particle_flips=particle_sims=particle_lone_flips=particle_lone_sims=0;
+}
+/* AdvanceGPUParticleFrame from PreInitViews: 1 flips (the original runs), 0 skips the flip. */
+ABI int medievil_particle_advance(uintptr_t fx) {
+    const int slot=particle_slot(fx);
+    if (slot<0) return 1;
+    int flip=1;
+    if (!particle_fx[slot].simulated) {
+        ++particle_lone_flips;
+        flip=!particle_guard_on();
+    }
+    if (flip) { ++particle_flips; particle_fx[slot].simulated=0; }
+    return flip;
+}
+/* PreRender, before the main-phase simulation: 1 flips first (AdvanceGPUParticleFrame). */
+ABI int medievil_particle_pre_render(uintptr_t fx) {
+    const int slot=particle_slot(fx);
+    if (slot<0) return 0;
+    int flip=0;
+    if (particle_fx[slot].simulated) {
+        ++particle_lone_sims;
+        flip=particle_guard_on();
+        if (flip) ++particle_flips;
+    }
+    particle_fx[slot].simulated=1;
+    ++particle_sims;
+    particle_guard_report();
+    return flip;
 }
 
 /* A switch asked for by the in-game menu (window thread), done on the next game-thread poll. */
@@ -625,6 +808,28 @@ void runtime_ue4_setres_poll(void) {
         strcpy(text,ue4_requested);
         if (reads>=120) ue4_setres(text);
         automatic_done=1; /* a choice in the menu wins over the start setting */
+    }
+    /* Menu switches, and the ini's at start: kept until the main menu (after the engine has read
+     * its own settings, which would otherwise win). */
+    if (reads>=600) {
+        ue4_particle_pass_poll(); /* requests its cvar for the loop below */
+        for (size_t i=0;i<UE4_CVARS;++i) {
+            if (!__atomic_exchange_n(&ue4_cvar_pending[i],0,__ATOMIC_ACQ_REL)) continue;
+            char text[sizeof(ue4_cvar_values[0])];
+            strcpy(text,ue4_cvar_values[i]);
+            const unsigned char *image=runtime_image_base();
+            const Ue4CvarSite *at=NULL;
+            for (size_t b=0;image && b<sizeof(ue4_cvars[i].at)/sizeof(ue4_cvars[i].at[0]);++b) {
+                const Ue4CvarSite *c=&ue4_cvars[i].at[b];
+                if (runtime_image_size()>=c->object+16 && runtime_image_size()>=c->site+sizeof(c->code) &&
+                    !memcmp(image+c->site,c->code,sizeof(c->code))) { at=c; break; }
+            }
+            if (!at) {
+                printf("UE4: %s unavailable (not an analysed MediEvil eboot: 01.00 or 01.02)\n",ue4_cvars[i].name);
+                continue;
+            }
+            ue4_set_cvar(at->object+8,ue4_cvars[i].name,text);
+        }
     }
     if (automatic_done) return;
     const char *want=getenv("GOW3_UE4_SETRES");

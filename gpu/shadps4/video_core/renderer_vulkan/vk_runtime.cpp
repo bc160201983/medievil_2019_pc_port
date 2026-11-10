@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/renderer_vulkan/vk_wait_diagnostics.h"
+#include <mutex>
+#include <string>
+#include <set>
 #include <boost/container/small_vector.hpp>
+#include "gow3_sections.h"
 #include "gow3_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -203,7 +208,48 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    // gow3 GOW3_PERF_DIAG: which image the first barrier of the next flush is for (size, format).
+    if (prev_num_barriers == 0 && !image_barriers.empty() && WaitDiagnostics::Enabled()) {
+        first_image_desc = std::to_string(image->info.size.width) + "x" +
+                           std::to_string(image->info.size.height) + " " +
+                           vk::to_string(image->info.pixel_format);
+    }
     return image_barriers.size() != prev_num_barriers;
+}
+
+bool Runtime::SampleDepthInPlace(VideoCore::Image* image) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GOW3_DEPTH_SAMPLE_IN_PLACE");
+        return !(env && env[0] == '0'); // default on (launcher: perf_lean_barriers)
+    }();
+    auto& backing = *image->backing;
+    if (!enabled || backing.state.layout != vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+        !backing.subresource_states.empty()) {
+        return false;
+    }
+    BeforeImageAccess();
+    if (scene_targets) scene_targets->NativeAccess(*image, vk::AccessFlagBits2::eShaderRead);
+    // The read joins the tracked state: a later barrier (a write, a layout change) waits for it.
+    backing.state.access_mask |= vk::AccessFlagBits2::eShaderRead;
+    backing.state.pl_stage |= vk::PipelineStageFlagBits2::eAllCommands;
+    return true;
+}
+
+bool Runtime::KeepStencilAttachment(VideoCore::Image* image, vk::AccessFlags2 access) {
+    BeforeImageAccess();
+    auto& backing = *image->backing;
+    constexpr auto allowed = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                             vk::AccessFlagBits2::eShaderRead;
+    if (backing.state.layout != vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
+        !backing.subresource_states.empty() || (backing.state.access_mask & ~allowed)) {
+        return false;
+    }
+    if (scene_targets) scene_targets->NativeAccess(*image, access);
+    backing.state.access_mask |= access;
+    backing.state.pl_stage |= vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                              vk::PipelineStageFlagBits2::eLateFragmentTests;
+    return true;
 }
 
 Runtime::TransferMark::TransferMark(Runtime& runtime, const char* what,
@@ -698,13 +744,23 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         FlushBarriers();
     }
 
-    const vk::ImageSubresourceRange vk_range = {
+    vk::ImageSubresourceRange vk_range = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = range.base.level,
         .levelCount = range.extent.levels,
         .baseArrayLayer = range.base.layer,
         .layerCount = range.extent.layers,
     };
+    if (dst->info.props.is_volume) {
+        // gow3: the layers of a render target view of a volume are its depth slices; a clear
+        // covers the whole volume (Vulkan: layer 0, count 1 for 3D images).
+        if (range.base.layer != 0 || range.extent.layers != dst->info.size.depth) {
+            LOG_WARNING(Render_Vulkan, "Clearing slices {}+{} clears the whole {}-slice volume",
+                        range.base.layer, range.extent.layers, dst->info.size.depth);
+        }
+        vk_range.baseArrayLayer = 0;
+        vk_range.layerCount = 1;
+    }
     scheduler.Record([image = dst->GetImage(), color = clear_value.color,
                       vk_range](vk::CommandBuffer cmdbuf) {
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
@@ -712,6 +768,37 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+void Runtime::CopyBufferToStencil(VideoCore::Image* dst, const VideoCore::Buffer* src, u64 offset,
+                                  u32 width, u32 height) {
+    scheduler.EndRendering();
+    const u64 size = u64(width) * height;
+    bool needs_flush =
+        Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
+                vk::AccessFlagBits2::eTransferWrite);
+    needs_flush |= IsBufferAccessed(src, offset, size);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+    const vk::BufferImageCopy copy = {
+        .bufferOffset = offset,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource{
+            .aspectMask = vk::ImageAspectFlagBits::eStencil,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {width, height, 1},
+    };
+    scheduler.Record([buffer = src->Handle(), image = dst->GetImage(), copy](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal, copy);
+    });
+    AccessBuffer(src, offset, size, vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
 }
 
 // gow3: render target clears of a 3D image address its depth slices (2D array views), which a
@@ -906,7 +993,40 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
 }
 
-void Runtime::FlushBarriers() {
+// gow3 GOW3_PERF_DIAG: names for a barrier that ends an open render pass.
+static std::string StageNames(vk::PipelineStageFlags2 stages) {
+    using S = vk::PipelineStageFlagBits2;
+    std::string out;
+    const auto add = [&](S bit, const char* name) {
+        if (stages & bit) {
+            out += out.empty() ? "" : "+";
+            out += name;
+        }
+    };
+    add(S::eTransfer, "transfer");
+    add(S::eCopy, "copy");
+    add(S::eComputeShader, "compute");
+    add(S::eVertexInput, "vertex-input");
+    add(S::eVertexShader, "vertex");
+    add(S::eFragmentShader, "fragment");
+    add(S::eEarlyFragmentTests, "early-z");
+    add(S::eLateFragmentTests, "late-z");
+    add(S::eColorAttachmentOutput, "color-out");
+    add(S::eHost, "host");
+    add(S::eAllGraphics, "all-graphics");
+    add(S::eAllCommands, "all");
+    return out.empty() ? "none" : out;
+}
+
+static std::string_view InternKey(std::string key) {
+    static std::mutex mutex;
+    static std::set<std::string> keys;
+    std::scoped_lock lock{mutex};
+    return *keys.insert(std::move(key)).first;
+}
+
+void Runtime::FlushBarriers(std::source_location caller) {
+    GOW3_SECTION(FlushBarriers);
     BeforeImageAccess();
     vk::DependencyInfo dep_info{};
 
@@ -921,6 +1041,28 @@ void Runtime::FlushBarriers() {
 
     if (!dep_info.memoryBarrierCount && !dep_info.imageMemoryBarrierCount) {
         return;
+    }
+    if (Gow3Stats::enabled) {
+        Gow3Stats::barrier_flushes.fetch_add(1, std::memory_order_relaxed); // "Arena writes" line
+    }
+
+    // Every barrier is counted (each can drain the GPU); those recorded between passes are marked.
+    if (WaitDiagnostics::Enabled()) {
+        std::string file{caller.file_name()};
+        file = file.substr(file.find_last_of("/\\") + 1);
+        std::string key = std::string(scheduler.IsRendering() ? "" : "(between passes) ") + file + ":" +
+                          std::to_string(caller.line()) + " ->";
+        if (dep_info.memoryBarrierCount) {
+            key += " memory from " + StageNames(memory_barrier.srcStageMask);
+        }
+        if (!image_barriers.empty()) {
+            const auto& first = image_barriers.front();
+            key += " " + std::to_string(image_barriers.size()) + " image(s) [" +
+                   (first_image_desc.empty() ? std::string("?") : first_image_desc) + "] " +
+                   vk::to_string(first.oldLayout) + ">" + vk::to_string(first.newLayout) + " from " +
+                   StageNames(first.srcStageMask) + " to " + StageNames(first.dstStageMask);
+        }
+        WaitDiagnostics::BarrierBreaks().Add(InternKey(std::move(key)), 0, 0, 0);
     }
 
     // gow3: the largest batches in the log (AMD's older driver crashed at 3696 image barriers).
@@ -958,6 +1100,7 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
+    first_image_desc.clear();
     barrier_tracker.Clear();
     ++access_epoch;
 }

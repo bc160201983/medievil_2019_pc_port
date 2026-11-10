@@ -32,6 +32,7 @@ FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PORT_DIR / 'scripts'))
 import save_backup  # noqa: E402  (scripts/)
+import graphics_options  # noqa: E402  (scripts/)
 WINDOWS = sys.platform == 'win32'
 DATA_DIR = Path(os.environ.get('GOW3_DATA_DIR', PORT_DIR))
 # Portable mode (issue #19): with a file portable.txt beside the launcher, its settings and caches
@@ -49,8 +50,8 @@ MOD_PRESETS = DATA_DIR / 'mods_presets.json'
 APP_NAME = 'MediEvil'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-# This build. The launcher checks the GitHub releases at start and offers newer versions.
-VERSION = '1.3.8'
+# This build. The launcher checks GitHub releases at start and offers newer versions.
+VERSION = '1.4.0'
 RELEASES_API = 'https://api.github.com/repos/bc160201983/medievil_2019_pc_port/releases/latest'
 RELEASES_PAGE = 'https://github.com/bc160201983/medievil_2019_pc_port/releases'
 # The port's pages (Home and Advanced), opened in the browser.
@@ -155,26 +156,32 @@ def windows_language():
 # Settings. medievil.ini keys (the game reads them, the in-game menu edits them) and the
 # launcher's own settings.json (passed to run.py as environment variables).
 
-INI_FLAGS = {'cheat_menu', 'cheat_infinite_ammo', 'cheat_double_jumps', 'cheat_very_hard', 'sharpen', 'object_motion', 'show_fps', 'vsync', 'async_shaders', 'deferred_readback',
-             'stale_readback', 'fsr1', 'rcas'}
+INI_FLAGS = {'cheat_menu', 'cheat_infinite_ammo', 'cheat_double_jumps', 'cheat_very_hard', 'show_fps', 'vsync', 'async_shaders', 'deferred_readback',
+             'stale_readback', 'fsr1', 'rcas', 'ue4_dlss'}
 # The graphics keys are also in the in-game menu (Insert / R3+L2); run.py reads the startup ones.
-INI_DEFAULTS = {'upscaler': 'off', 'preset': '1', 'sharpen': '1', 'sharpness': '0.50',
-                'object_motion': '1', 'show_fps': '1', 'output_res': '1920x1080',
-                'live_resolution': 'auto', 'display_mode': 'windowed', 'vsync': '1', 'fps_limit': '0',
-                'async_shaders': '1', 'deferred_readback': '1', 'stale_readback': '0',
-                'render_resolution': 'native', 'engine_fps': '60', 'fps_default_60': '1', 'fsr1': '0', 'rcas': '1',
-                'rcas_strength': '75', 'frames_queued': '1', 'ue4_quality': 'console', 'cheat_very_hard': '0', 'cheat_double_jumps': '0', 'cheat_menu': '0', 'cheat_infinite_ammo': '0', 'ue4_upscale': 'off', 'ue4_aa': 'taa', 'ue4_voice': ''}
+# The God of War III port's temporal upscaler keys (upscaler, preset, output_res, sharpen, ...)
+# are not set here: run.py turns that upscaler off for MediEvil (its page was removed).
+INI_DEFAULTS = {'show_fps': '1', 'display_mode': 'windowed', 'vsync': '1', 'fps_limit': '0',
+                'async_shaders': '1', 'deferred_readback': '1', 'stale_readback': '1',
+                'output_resolution': '1920x1080', 'render_scale': '100', 'engine_fps': '60', 'fsr1': '0',
+                'rcas': '1', 'rcas_strength': '75', 'frames_queued': '1', 'ue4_quality': 'console',
+                'ue4_dlss': '0',
+                'effects_resolution': '75',
+                'cheat_very_hard': '0', 'cheat_double_jumps': '0', 'cheat_menu': '0', 'cheat_infinite_ammo': '0',
+                'ue4_aa': 'taa', 'ue4_voice': ''}
 DISPLAY_MODES = [('windowed', ('Windowed',)), ('borderless', ('Borderless',)), ('fullscreen', ('Fullscreen',))]
-FPS_LIMITS = [('30', ('30',)), ('60', ('60',)), ('120', ('120',)), ('240', ('240',)), ('0', ('Unlimited',)),
-              ('-1', ('Half display refresh (smoothest)',))]
-# No default game folder on Linux: the port's folder is inside the read-only AppImage there.
+FPS_LIMITS = [('-2', ('Auto: refresh (VRR: below it, Reflex rule)',)), ('-3', ('Auto: half refresh (VRR: one below)',)),
+              ('30', ('30',)), ('60', ('60',)), ('119', ('119 (VRR, 240 Hz)',)), ('120', ('120',)),
+              ('141', ('141 (VRR, 144 Hz)',)), ('237', ('237 (VRR, 240 Hz)',)), ('240', ('240',)),
+              ('0', ('Unlimited',)), ('-1', ('Half display refresh (fixed refresh)',))]
 APP_DEFAULTS = {'ui_language': 'en', 'game_dir': os.environ.get('GOW3_GAME_DIR', str(PORT_DIR.parent / 'medieval' / 'CUSA11227') if WINDOWS else ''), 'user_dir': '',
                 'mods_dir': '', 'mods_enabled': True, 'patches_dir': '', 'language': '1',
                 'player_name': '', 'hdr': False, 'draw_pipe': '', 'readbacks': '', 'vulkan_compat': False,
                 'background_warmup': True, 'parallel_warmup': True, 'pipeline_binary_cache': True, 'perf_diag': False, 'frame_capture_key': False, 'frame_stats': False, 'gpu_profile': False,
-                'vk_validation': False, 'close_on_play': False,
-                'update_check': True, 'game_patches': {}, 'controls': {}, 'pad_style': 'playstation', 'stick_range': '',
-                'last_pkg': ''}
+                'vk_validation': False, 'close_on_play': False, 'prep_workers': '', 'stage_b_core': False,
+                'update_check': True, 'game_patches': {}, 'game_patches_seen': {}, 'controls': {}, 'pad_style': 'playstation', 'stick_range': '',
+                'last_pkg': '', 'graphics_preset': '', 'deck_switches': False, 'deck_switches_off': '',
+                'deck_offered': False}
 
 # PS4 button, default key, default gamepad button (SDL names; src/runtime_pad.c). L2/R2 come
 # from the analog triggers and are not remapped on the gamepad.
@@ -216,18 +223,6 @@ def control_map(controls, kind):
                     if isinstance(chosen.get(button), str) and chosen[button].strip()
                     and not set(chosen[button]) & set(',='))
 
-UPSCALERS = [('dlss', ('DLSS (NVIDIA GeForce RTX)',)),
-             ('fsr4', ('FSR 4 (best quality)', 'FSR 4 (лучшее качество)')),
-             ('fsr411', ('FSR 4.1.1 (needs fsr4_411 assets)', 'FSR 4.1.1 (нужны ассеты fsr4_411)')),
-             ('fsr3', ('FSR 3.1 (every GPU)', 'FSR 3.1 (любая видеокарта)')),
-             ('taa', ('TAA (native resolution anti-aliasing)', 'TAA (нативное сглаживание)')),
-             ('off', ('Off', 'Выключен'))]
-PRESETS = [('0', ('Native AA (×1.0)',)), ('1', ('Quality (×1.5)',)), ('2', ('Balanced (×1.7)',)),
-           ('3', ('Performance (×2)',)), ('4', ('Ultra Performance (×3)',))]
-OUTPUTS = [('1280x720', ('1280 × 720 (Steam Deck)',)), ('1920x1080', ('1920 × 1080',)),
-           ('2560x1440', ('2560 × 1440',)), ('3840x2160', ('3840 × 2160 (4K)',))]
-LIVE = [('auto', ('Auto (by graphics card)', 'Авто (по видеокарте)')), ('0', ('Off (faster)', 'Выключена (быстрее)')),
-        ('1', ('On (change without restarting)', 'Включена (без перезапуска)'))]
 # PS4 system language codes (sceSystemServiceParamGetInt LANG) of the languages MediEvil ships.
 LANGUAGES = [('1', ('English', 'Английский')), ('18', ('English (UK)',)), ('8', ('Russian', 'Русский')),
              ('0', ('Japanese', 'Японский')), ('2', ('French', 'Французский')), ('3', ('Spanish', 'Испанский')),
@@ -248,32 +243,115 @@ DRAW_PIPE = [('', ('Auto (8+ threads)', 'Авто (8+ потоков)')), ('1', 
 # "Precise" (GOW3_READBACKS=2) left MediEvil on a black screen (issue #15): not offered, and a
 # saved choice of it starts with the default.
 READBACKS = [('', ('Relaxed (default)', 'Relaxed (по умолчанию)')), ('0', ('Off', 'Выключены'))]
+# Draw preparation helper threads (GOW3_PREP_WORKERS); '' = the runtime's default (half the CPU threads).
+PREP_WORKERS = [('', ('Auto (half the CPU threads)',)), ('0', ('0 (none)',)), ('1', ('1',)), ('2', ('2',)),
+                ('3', ('3',)), ('4', ('4',)), ('6', ('6',)), ('8', ('8',))]
 FRAMES_QUEUED = [('1', ('1 (lowest latency)',)), ('2', ('2',)), ('0', ('Unlimited',))]
+# Performance patches (research/docs/plan-stage-b-split.md, plan-frame-pacing.md): each is on by
+# default except graphics_options.PERF_DEFAULT_OFF; switched off, its environment variables restore the earlier behaviour (A/B tests,
+# or a fallback if one misbehaves on another PC). medievil.ini keys, shared with the in-game menu;
+# run.py turns them into the variables (graphics_options.PERF_SWITCHES).
+# (key, title, description, variables).
+PERF_PATCHES = [
+    ('perf_hzb_occlusion', 'HZB occlusion culling',
+     "Unreal Engine 4's own culling skips objects hidden behind others, served from the GPU's "
+     'finished results without waiting for it. Heavy areas ~130 -> ~165 FPS (MediEvil 01.00 and 01.02; '
+     'off: no occlusion culling, as before).',
+     {'GOW3_HZB_REMAP': '0'}),
+    ('perf_no_decal_prepass', 'Skip the decal depth prepass',
+     'The PS4 build draws the whole scene twice (depth first) for a few decals that are almost '
+     'invisible. About 600 fewer draws a frame in heavy areas: ~10% FPS and the best 1% lows.',
+     {'GOW3_DECAL_PREPASS': '1'}),
+    ('perf_particle_single_pass', 'Single GPU particle pass',
+     'Particles are simulated once a frame with the real frame time instead of a second, empty '
+     'fixed-step pass: up to ~190 fewer draws while particles are on screen. Off by default: some '
+     'torches animate very slowly with it.',
+     {'GOW3_PARTICLE_FIXED_STEP': '1'}),
+    ('perf_small_buffers', 'Small buffers from VRAM',
+     'Small vertex and constant buffers the game has not changed are read from video memory instead '
+     'of being copied for every draw (~1 GB/s less copying): about 5% in heavy areas.',
+     {'GOW3_STREAM_CLEAN': '0'}),
+    ('perf_texture_memo', 'Texture set memo',
+     'Textures bound by a draw are remembered and reused unless their own memory changes (not '
+     'whenever any texture streams in): texture binding ~7% cheaper, steadier when panning.',
+     {'GOW3_TEXSET_REGIONS': '0', 'GOW3_TEXSET_TWO_WAY': '0'}),
+    ('perf_lockfree_memory', 'Lock-free memory map lookups',
+     "The GPU threads read the game's memory map without waiting for the game to finish committing "
+     'or freeing memory: half the per-draw work while new content streams in (panning spikes).',
+     {'GOW3_OPTIMISTIC_CLAMP': '0', 'GOW3_REGION_BUCKETS': '0'}),
+    ('perf_cheap_frees', 'Cheap memory frees',
+     "Memory the game frees (about a thousand times a second) keeps its page access instead of being "
+     'locked: frees ~7x cheaper, the memory map blocked a third as often (smoother 0.1% lows).',
+     {'GOW3_DECOMMIT_KEEP_ACCESS': '0'}),
+    ('perf_gpu_data_no_waits', 'GPU data without waits',
+     'Data the GPU writes is read back on a separate queue, kept beside the game\'s copy, and fences '
+     'are signalled without stopping the draw thread: removed the constant micro-stutter (frame time '
+     'spread 0.56 -> 0.06 ms in light areas).',
+     {'GOW3_READBACK_QUEUE': '0', 'GOW3_GPU_WRITE_TWINS': '0', 'GOW3_EOS_DEFERRED': '0',
+      'GOW3_EOP_TARGETED': '0'}),
+    ('perf_4k_memory', '4K memory sizes',
+     "Above 1080p the game gets 2 GB more memory than a PS4 (7,104 MB instead of 5,056), which it "
+     "pools for graphics and texture streaming (output sizes above 1080p only).",
+     {'GOW3_PS4_MEMORY': '1'}),
+    ('perf_lean_barriers', 'Fewer render pass breaks',
+     'The depth buffer is no longer switched between layouts, with a barrier each time, for every '
+     'effect draw that reads it (death effects made ~100 needless pass breaks a frame): in fights the '
+     'draw thread stays below 50% busy instead of 95%, 0.1% lows ~100 -> ~117 FPS at a 120 cap, '
+     'no GPU usage spikes.',
+     {'GOW3_SKIP_READ_BARRIERS': '0', 'GOW3_DEPTH_SAMPLE_IN_PLACE': '0'}),
+    ('perf_lean_binding', 'Cheaper draw binding',
+     "Each draw's descriptors are handed to the recording thread in one piece instead of ~16 small "
+     "copies, and sampler handles are reused instead of hashed and looked up under a lock every draw: "
+     '~0.3 ms less draw-thread work in heavy frames (~1,500 draws), most useful on slower CPUs. '
+     'Applies at once in the in-game menu.',
+     {'GOW3_LEAN_BINDING': '0'}),
+    ('perf_ring_reuse', 'Constant ring reuse',
+     "Shader constants the game binds again within one of its command buffers reuse the copy already in "
+     'video memory instead of being copied again (about 13 -> 4 MB a frame written over PCIe): heavy-area '
+     '0.1% lows ~145 -> ~185 FPS. Applies at once in the in-game menu.',
+     {'GOW3_RING_REUSE': '0'}),
+]
+INI_FLAGS.update(entry[0] for entry in PERF_PATCHES)
+INI_DEFAULTS.update({entry[0]: '0' if entry[0] in graphics_options.PERF_DEFAULT_OFF else '1'
+                     for entry in PERF_PATCHES})
+
+# Presentation (research/docs/plan-stage-b-split.md, T-L2 to T-V120h): how finished frames reach the
+# screen. All off by default (the tested defaults); run.py turns them into environment variables
+# (graphics_options.present_environment). (key, title, description).
+PRESENT_SWITCHES = [
+    ('present_inline', 'Present on the vblank thread',
+     'Shows frames from the vblank thread itself, as upstream shadPS4 does, instead of a separate swap '
+     'thread. A present that waits for the display then also delays the next vblank.'),
+    ('present_precise_tick', 'Precise vblank tick',
+     'The vblank tick runs on a fixed grid with a high-resolution timer and a short spin instead of '
+     "Windows' coarse sleep (about 8% of one CPU core at 120 Hz)."),
+]
+# Advanced > Diagnostics: one CSV line per flip stage (GOW3_FLIP_TRACE, graphics_options.present_environment);
+# not the frame statistics' 5 s summary.
+FRAME_TRACE = ('present_frame_trace', 'Frame timing trace',
+               'Writes every frame\'s timing to user/logs/flip-trace.csv (overwritten at each start).')
+# One VSync control (vsync_choice_var): On / Off set the vsync key the in-game menu also switches
+# (live); the two special modes set a fixed present_mode, which overrides that switch.
+VSYNC_CHOICES = [('on', ('On',)), ('off', ('Off',)), ('immediate', ('Off, allow tearing',)),
+                 ('fifo_relaxed', ('Adaptive',))]
+VSYNC_HINT = ('On: no tearing; with G-Sync / FreeSync and a frame rate limit below the refresh it adds no latency. '
+              'Off: lower latency, no tearing. On and Off can also be switched live in the game\'s menu. '
+              'Off, allow tearing: the lowest latency. Adaptive: on, but a late frame shows at once (may tear). '
+              'These two fix the mode: the in-game switch then has no effect.')
+PRESENT_LIMITERS = [('reflex', ('NVIDIA Reflex (recommended)',)), ('precise', ('Precise',)),
+                    ('standard', ('Standard',))]
+# The engine frame rate choice also covers "no built-in caps" (present_no_frame_caps).
+ENGINE_CAP_CHOICES = [('60', ('60 (original)',)), ('120', ('120',)), ('240', ('240',)),
+                      ('unlimited', ('Unlimited (no built-in caps)',))]
+INI_FLAGS.update(entry[0] for entry in PRESENT_SWITCHES)
+INI_FLAGS.update({FRAME_TRACE[0], 'present_no_frame_caps', 'display_vrr'})
+INI_DEFAULTS.update({'present_inline': '1', 'present_precise_tick': '1', 'present_frame_trace': '0',
+                     'present_no_frame_caps': '0', 'present_tick_hz': '960', 'present_mode': 'auto',
+                     'present_limiter': 'reflex', 'fps_limit': '-3', 'display_vrr': '1'})
 # GOW3_STICK_RANGE (issue #36): that much tilt is a full push, for sticks that never reach the edge.
 STICK_RANGES = [('', ('Full tilt (default)',)), ('90', ('90%',)), ('85', ('85%',)), ('80', ('80%',)),
                 ('70', ('70%',))]
 UI_LANGUAGES = lang.LANGUAGE_NAMES
-
-FSR4_COMMIT = 'ae8d628fae208813172446d1e49ed94150b04658'
-FSR4_BASE = f'https://raw.githubusercontent.com/FireBurn/Q2RTX/{FSR4_COMMIT}/baseq2/fsr4_shaders'
-
-
-def fsr4_files():
-    """The FSR 4 v07 asset set of tools/fetch_fsr4_assets.sh (1080 and 2160 tiers)."""
-    files = ['LICENSE-FSR4-v07.txt', 'rcas.spv', 'spd_auto_exposure.spv']
-    for model in ('native', 'quality', 'balanced', 'performance', 'ultraperf', 'drs'):
-        files += [f'fsr4_model_v07_i8_{model}_initializers.bin', f'fsr4_model_v07_i8_{model}_pre_weights.bin',
-                  f'fsr4_model_v07_i8_{model}_shader_manifest.json']
-        for tier in ('1080', '2160'):
-            files += [f'fsr4_model_v07_i8_{model}_{tier}_pre.spv', f'fsr4_model_v07_i8_{model}_{tier}_post.spv']
-            files += [f'fsr4_model_v07_i8_{model}_{tier}_pass{n}.spv' for n in range(1, 13)]
-    return files
-
-
-def fsr4_missing():
-    folder = PORT_DIR / 'fsr4_shaders'
-    return [name for name in fsr4_files() if not (folder / name).is_file() or not (folder / name).stat().st_size]
-
 
 def load_json(path, default):
     try:
@@ -294,7 +372,10 @@ def ini_path():
 
 
 def load_ini():
-    values, lines = dict(INI_DEFAULTS), []
+    # Graphics settings missing from the file stay out: graphics_migration (run by both callers) fills them
+    # from the file's ue4_quality. INI_DEFAULTS holds Console's, which a Low file must not get.
+    values = {key: value for key, value in INI_DEFAULTS.items() if key not in graphics_options.GRAPHICS_KEYS}
+    lines, found = [], {}
     try:
         lines = ini_path().read_text(encoding='utf-8').splitlines()
     except OSError:
@@ -303,11 +384,10 @@ def load_ini():
     for line in lines:
         if '=' in line and not line.lstrip().startswith('#'):
             key, value = line.split('=', 1)
-            values[key.strip()] = value.strip()
-            seen.add(key.strip())
-    if lines and 'fps_default_60' not in seen:
-        # 1.3.4: settings from before go back to 60 FPS once (above 60 is experimental).
-        values['engine_fps'] = '60'
+            found[key.strip()] = value.strip()
+    values.update(found)
+    # The single render_resolution (and ue4_upscale) of earlier versions as the two settings.
+    values.update(graphics_options.migrate_resolution(found))
     return values, lines
 
 
@@ -349,13 +429,42 @@ def game_profile_of(folder):
     return title_id, game_profile(title_id, version) or game_profile(title_id)
 
 
+def chosen_by_run_py(name):
+    """Patches run.py picks from medievil.ini (resolution, frame rate, output size): not on the Patches page."""
+    from patches import EXCLUSIVE_PREFIX
+    return name.startswith(EXCLUSIVE_PREFIX) or name.startswith('Frame Rate Patch') or \
+        name in (graphics_options.BOOT_SIZE_PATCH, graphics_options.BOOT_4K_PATCH)
+
+
+# Built-in patches added after the launcher started keeping game_patches_seen (2026-11-02): for a
+# selection saved before, every other patch counts as seen.
+PATCHES_AFTER_SEEN_LIST = {'GPU particle bounds'}
+
+
+def game_patch_selection(s, title_id, profile):
+    """[names] on the Patches page for this game's version, or None without a saved selection (the
+    file's defaults). A default patch added after the selection was saved is on: game_patches_seen
+    lists the patches the page showed then, so a default the user switched off stays off."""
+    import xml.etree.ElementTree as ET
+    chosen = s.get('game_patches', {}).get(title_id) if title_id else None
+    if not profile or chosen is None:
+        return None
+    metas = [m for m in ET.parse(profile[1]).getroot().iter('Metadata')
+             if m.get('AppVer') == profile[2] and not chosen_by_run_py(m.get('Name'))]
+    default = {m.get('Name') for m in metas if m.get('isEnabled', 'false').lower() == 'true'}
+    seen = s.get('game_patches_seen', {}).get(title_id)
+    if seen is None:
+        seen = {m.get('Name') for m in metas} - PATCHES_AFTER_SEEN_LIST
+    return [m.get('Name') for m in metas if m.get('Name') in chosen or m.get('Name') in default - set(seen)]
+
+
 def game_environment(s):
     env = dict(os.environ)
     env['GOW3_GAME_DIR'] = s['game_dir']
     # The launcher's patch selection is the whole list (run.py, patches.py).
     title_id, profile = game_profile_of(s['game_dir'])
-    chosen = s.get('game_patches', {}).get(title_id) if title_id else None
-    if profile and chosen is not None:
+    chosen = game_patch_selection(s, title_id, profile)
+    if chosen is not None:
         env['GOW3_PATCHES'] = ';'.join(chosen)
         env['GOW3_PATCHES_ONLY'] = '1'
     if s['user_dir']:
@@ -378,6 +487,16 @@ def game_environment(s):
         env['GOW3_VULKAN_COMPAT'] = '1'
     env['GOW3_BACKGROUND_WARMUP'] = '1' if s.get('background_warmup', True) else '0'
     env['GOW3_PARALLEL_WARMUP'] = '1' if s.get('parallel_warmup', True) else '0'
+    if s.get('prep_workers', '') != '':
+        env['GOW3_PREP_WORKERS'] = str(s['prep_workers'])
+    if s.get('stage_b_core', False):
+        env['GOW3_STAGE_B_CORE'] = '1'
+    # Deck Optimized (DECK_SWITCH_ITEMS): the checked ones that work here; a variable already set wins.
+    deck_env, deck_summary = deck_switch_env(s)
+    for name, value in deck_env.items():
+        env.setdefault(name, value)
+    if deck_summary:
+        env['GOW3_DECK_SWITCHES'] = deck_summary  # logged by run.py
     env['GOW3_PIPELINE_BINARIES'] = '1' if s.get('pipeline_binary_cache', True) else '0'
     env.setdefault('GOW3_PERF_DIAG', '1' if s.get('perf_diag', False) else '0')
     for key, name in (('frame_stats', 'GOW3_FRAME_STATS'), ('gpu_profile', 'GOW3_GPU_PROFILE'),
@@ -390,7 +509,8 @@ def game_environment(s):
         if value := control_map(s.get('controls', {}), kind):
             env[name] = value
     env.setdefault('GOW3_FPS_LOG', '1')  # FPS and worst frame every 5 s in the log (diagnostics)
-    env.setdefault('GOW3_FRAME_STATS', '1')  # draws, compiles and stalls every 5 s (diagnostics)
+    # Frame statistics (draws, compiles, stalls every 5 s) only with Advanced > Frame statistics:
+    # part of them is printed by the draw recording thread and costs frame time stability (T-S2b).
     # F12 in the game saves a PNG screenshot of the game's picture.
     env.setdefault('GOW3_SCREENSHOT_DIR', str(screenshots_dir(s)))
     # Shift+F12 (or creating the trigger file) saves raw frames for bug reports. Each session gets
@@ -464,31 +584,176 @@ class ImageButton:
 
     def pack(self, **kwargs):
         self.label.pack(**kwargs)
-RESOLUTION_CHOICES = [('native', ('Native (1080p)',)), ('720p', ('720p (faster)',)),
-                      ('1440p', ('1440p',)), ('1800p', ('1800p',)), ('4K', ('4K (sharpest)',)),
-                      ('720p_native', ('720p native output',)), ('1440p_native', ('1440p native output',)),
-                      ('1800p_native', ('1800p native output',)), ('4K_native', ('4K native output (4K TV)',))]
-UPSCALE_CHOICES = [('off', ('Off',)), ('quality', ('Quality (67%)',)), ('balanced', ('Balanced (58%)',)),
-                   ('performance', ('Performance (50%)',))]
+# Output: the game's own picture at that size (for that display). Scene in 1080p: a 1080p picture whose
+# 3D scene is drawn at that size and scaled into it (supersampling for a 1080p display).
+# medievil.ini output_resolution: any WxH works (shown as "Custom"); graphics_options.parse_output.
+OUTPUT_CHOICES = [('display', ('Match display ({}x{})'.format(*graphics_options.display_size()),)),
+                  ('3840x2160', ('4K (3840x2160)',)), ('3200x1800', ('1800p (3200x1800)',)),
+                  ('2560x1440', ('1440p (2560x1440)',)), ('1920x1080', ('1080p (original)',)),
+                  ('1280x720', ('720p (1280x720)',))]
+OUTPUT_HINT = ("The size of the game's picture. The game starts at this size, as a PS4 starts at its TV's; "
+               'match your display for a sharp 1:1 image (in windowed mode the window opens at this size). '
+               'Above 1080p the port also turns on its larger memory patches. Any size can be set in '
+               'medievil.ini (output_resolution=WxH). Applied at start.')
+RENDER_SCALE_CHOICES = [('200', ('200%: supersampled (sharpest, slowest)',)), ('167', ('167%: supersampled',)),
+                        ('133', ('133%: supersampled',)), ('100', ('100%: native',)),
+                        ('67', ('67%: upscaled, Quality',)), ('58', ('58%: upscaled, Balanced',)),
+                        ('50', ('50%: upscaled, Performance',))]
+RENDER_SCALE_HINT = ('How large the 3D scene is drawn, per side, compared with the output. Above 100%: drawn '
+                     'larger and scaled down (sharper edges, slower). Below 100%: drawn smaller and rebuilt at '
+                     "full size by the game's own temporal upscaler from its motion vectors (faster). The menus "
+                     'and HUD always draw at the output size. Pick a preset or type any value from 50 to 200%. '
+                     'Applied at start; the in-game menu (Performance > Applied now) also switches it while '
+                     'playing, from 50% up to the value the game started at (at least 100%).')
+
+
+def render_scale_scene(output, scale):
+    """The scene size a render scale gives at an output_resolution value, for the launcher's row."""
+    width, height = graphics_options.output_size(output)
+    return _('scene {}x{}').format(*graphics_options.scene_size(width, height,
+                                                                graphics_options.parse_render_scale(scale)))
 AA_CHOICES = [('taa', ('Temporal (default, smooth)',)), ('fxaa', ('FXAA (sharper)',)),
               ('off', ('Off (sharpest, jagged edges)',))]
 QUALITY_CHOICES = [('ultra', ('Ultra',)), ('high', ('High',)), ('console', ('Console (PS4)',)),
                    ('medium', ('Medium',)), ('low', ('Low (integrated graphics)',))]
-ENGINE_FPS_CHOICES = [('60', ('60 (original, recommended)',)), ('120', ('120 (experimental)',)),
-                      ('240', ('240 (experimental)',))]
+EFFECTS_CHOICES = [('100', ('100%',)), ('75', ('75% (default)',)), ('50', ('50% (PS4 detail at 4K)',))]
+# The graphics settings (scripts/graphics_options.py GRAPHICS_SETTINGS, the same table as the in-game menu's
+# gpu/shim/gow3_settings.h UE4LiveOptions; tests check they match): (key, title, hint, [(value, label)]).
+# Graphics quality sets all of them; a fresh medievil.ini starts at Console's (the PS4's) values.
+GRAPHICS_OPTIONS = [(key, title, hint, [(token, label) for token, label, _values in choices])
+                    for key, title, hint, _live, _cvars, choices, _levels in graphics_options.GRAPHICS_SETTINGS]
+INI_DEFAULTS.update(graphics_options.level_choices('console'))
+ENGINE_FPS_CHOICES = [('60', ('60 (original)',)), ('120', ('120',)), ('240', ('240',))]
+
+# Steam Deck (research/docs/plan-linux-deck.md, "Deck Optimized preset"): the user's flat 60 FPS in
+# the heaviest graveyard view (Deck OLED, SteamOS, AppImage, GPU clock fixed at 1,200 MHz): the Low
+# logging settings with an 80% render scale, volumetric fog and a 60 FPS limit. "Deck Optimized" in
+# Graphics quality writes these to medievil.ini (ue4_quality stays low for the game) and turns on
+# DECK_SWITCHES. The 60 cap: the engine is unbounded (present_no_frame_caps, engine_fps 240) and the
+# vblank tick runs at 900 Hz, far above the cap, so fps_limit is the only clock: the present thread
+# releases one flip per 1/60 s slot (Standard limiter: no Reflex, no second limiter at the same rate;
+# VSync off = Mailbox under gamescope, which offers no Immediate).
+DECK_PRESET = {
+    'show_fps': '0', 'display_mode': 'borderless', 'vsync': '0', 'fps_limit': '60', 'async_shaders': '1',
+    'deferred_readback': '1', 'stale_readback': '1', 'output_resolution': '1280x720', 'render_scale': '80',
+    'engine_fps': '240', 'fsr1': '0', 'rcas': '0', 'rcas_strength': '29', 'frames_queued': '1',
+    'ue4_quality': 'low', 'effects_resolution': '50', 'ue4_aa': 'taa',
+    'perf_hzb_occlusion': '1', 'perf_no_decal_prepass': '1', 'perf_particle_single_pass': '1',
+    'perf_small_buffers': '1', 'perf_texture_memo': '1', 'perf_lockfree_memory': '1', 'perf_cheap_frees': '1',
+    'perf_gpu_data_no_waits': '1', 'perf_4k_memory': '0', 'perf_lean_barriers': '1', 'perf_lean_binding': '1',
+    'perf_ring_reuse': '1',
+    'present_inline': '1', 'present_precise_tick': '0', 'present_frame_trace': '0', 'present_no_frame_caps': '1',
+    'present_tick_hz': '900', 'present_mode': 'auto', 'present_limiter': 'standard', 'display_vrr': '0',
+    'preshadows': '0', **graphics_options.level_choices(graphics_options.DECK_LEVEL)}
+# medievil.ini keys the launcher writes only when they are set (the in-game menu's own switches).
+INI_OPTIONAL_KEYS = ('preshadows',)
+# The Deck's measured wins that are still opt-in start switches (plan-linux-deck.md): early frame EOP,
+# decode pacing with a 2-frame lead, U2 off (no gain on the Deck, its tracking costs stage B), stage A's
+# hybrid drain wait (-1/3 of its CPU), the wide texture-set memo (T2), the region cache index (R1),
+# stage A's per-packet cuts A1 / A2 / A3, the particle flip guard (the single pass's lost updates: the
+# frozen torch, the crypt floor) and nice -10 for stage B and the vblank thread (better lows at a fixed
+# GPU clock). Measured on the Deck only, so they come with the preset (launcher setting deck_switches),
+# not as Linux defaults; an environment variable already set wins, and run.py applies extra-env.txt last.
+# One by one (Advanced: the switches under "Steam Deck performance switches"): (key, title, hint, variables,
+# why it does nothing on Windows or None). The Windows reasons are the code's: A1 and thread nice are Linux
+# code, and U2 is off on Windows anyway (buffer_cache.cpp HostVisibleArenaType), so those are greyed out
+# and never set there; the others run on both and are untested on Windows (research/patches/deck).
+DECK_SWITCH_ITEMS = [
+    ('early_frame_eop', 'Early frame end signals',
+     "The frame's end signal at decode instead of after recording (stage A runs ahead).",
+     {'GOW3_EARLY_FRAME_EOP': '1'}, None),
+    ('decode_pacing', 'Decode pacing (2 frames ahead)', 'Stage A decodes up to 2 frames ahead of the GPU.',
+     {'GOW3_DECODE_PACING': '1', 'GOW3_DECODE_PACING_LEAD': '2'}, None),
+    ('drain_hybrid', "Stage A's hybrid wait", 'Stage A spins briefly, then sleeps, while it waits for stage B.',
+     {'GOW3_DRAIN_HYBRID': '1'}, None),
+    ('texset_wide', 'Wide texture-set memo (T2)', 'Texture sets of draws without a prepared draw are memoized too.',
+     {'GOW3_TEXSET_WIDE': '1'}, None),
+    ('region_index', 'Region cache index (R1)', 'Guest memory lookups answered from an index by page.',
+     {'GOW3_REGION_INDEX': '1'}, None),
+    ('pending_filter', 'Pending-write filter (A2)', "Stage A's pending-write checks answered from a page filter.",
+     {'GOW3_PENDING_FILTER': '1'}, None),
+    ('reg_hash_paired', 'Paired register checksum (A3)', 'The register checksum takes two words per step.',
+     {'GOW3_REG_HASH_PAIRED': '1'}, None),
+    ('particle_flip_guard', 'Particle flip guard', "One state flip per particle simulation (the single pass's "
+     'frozen torches).', {'GOW3_PARTICLE_FLIP_GUARD': '1'}, None),
+    ('backing_copy', 'Backing copies without the lock (A1)', 'GPU-side guest copies read the backing memory '
+     'without the region table lock.', {'GOW3_BACKING_COPY': '1'}, 'Linux only'),
+    ('thread_nice', 'Thread priorities', 'Stage B and the vblank thread at a higher priority (nice -10).',
+     {'GOW3_THREAD_NICE': '1'}, 'Linux only'),
+    ('arena_writes_off', 'Direct arena writes off (U2)', 'Buffer data through staging copies instead of direct '
+     'writes (no gain on the Deck; their tracking costs stage B).', {'GOW3_ARENA_HOST_VISIBLE': '0'},
+     'already off on Windows'),
+]
+DECK_SWITCHES = {name: value for *_rest, env, _why in DECK_SWITCH_ITEMS for name, value in env.items()}
+
+
+def deck_switch_env(s, windows=WINDOWS):
+    """The Deck switches to set at start: with deck_switches on, every item not listed in deck_switches_off
+    (the ones unchecked) and not one that does nothing on this platform. Also the summary run.py logs."""
+    if not s.get('deck_switches', False):
+        return {}, ''
+    off = {key for key in str(s.get('deck_switches_off', '')).split(',') if key}
+    env, on, skipped = {}, [], []
+    for key, _title, _hint, variables, windows_reason in DECK_SWITCH_ITEMS:
+        if windows and windows_reason:
+            skipped.append(f'{key} ({windows_reason})')
+        elif key in off:
+            skipped.append(f'{key} (unchecked)')
+        else:
+            env.update(variables)
+            on.append(key)
+    summary = f'{len(on)} on: {", ".join(on) or "none"}' + (f'; off: {", ".join(skipped)}' if skipped else '')
+    if windows:
+        summary += '; Windows: untested'
+    return env, summary
+DECK_QUALITY = 'deck'
+QUALITY_PRESETS = [*QUALITY_CHOICES, (DECK_QUALITY, ('Deck Optimized',))]
+DECK_HINT = ('Steam Deck: in the Quick Access Menu (Performance) set a manual GPU clock of about 1,200 MHz and '
+             'keep the frame limit at 60 for a flat 60 FPS; an uncapped GPU takes power from the CPU and frame '
+             'times swing.')
+# Valve's boards in /sys/devices/virtual/dmi/id: Jupiter (Steam Deck LCD), Galileo (Steam Deck OLED).
+DECK_DMI = Path('/sys/devices/virtual/dmi/id')
+DECK_PRODUCTS = ('Jupiter', 'Galileo')
+
+
+def steam_deck(env=None, dmi=DECK_DMI):
+    """True on a Steam Deck: SteamDeck=1 (Steam sets it for what it starts) or the board's DMI
+    (vendor Valve, product Jupiter or Galileo)."""
+    env = os.environ if env is None else env
+    if env.get('SteamDeck') == '1':
+        return True
+
+    def read(name):
+        try:
+            return (Path(dmi) / name).read_text(encoding='utf-8', errors='replace').strip()
+        except OSError:
+            return ''
+    vendor = read('board_vendor') or read('sys_vendor')
+    product = read('product_name') or read('board_name')
+    return vendor == 'Valve' and product in DECK_PRODUCTS
+
+
+def deck_preset_offer(app, first_run, on_deck):
+    """What the launcher does about the Deck Optimized preset when it opens: 'select' on the first run
+    on a Deck (no settings.json and no medievil.ini yet), 'ask' once for an existing setup on a Deck,
+    else None (asked or chosen before, or not a Deck). Existing settings never change unasked."""
+    if not on_deck or app.get('deck_offered') or app.get('graphics_preset') == DECK_QUALITY:
+        return None
+    return 'select' if first_run else 'ask'
 
 
 class Launcher:
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
+        self.first_run = not CONFIG_FILE.exists() and not ini_path().exists()
         self.app = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
         if self.app.get('readbacks') == '2':  # "Precise" is no longer offered (issue #15)
             self.app['readbacks'] = ''
         self.ini, self.ini_lines = load_ini()
+        self.ini.update(graphics_options.graphics_migration(self.ini))  # older tokens, "preset", new keys
         self.vars = {}
         self.process = self.job = None
-        self.downloading = False
         self.output = queue.Queue()
         self.banner_source = self.banner_image = None
         self.ui_calls = queue.Queue()  # work for the Tk thread from helper threads
@@ -512,6 +777,7 @@ class Launcher:
         self.show('home')
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
+        root.after(400, self.offer_deck_preset)
         if self.app.get('update_check', True):
             root.after(1500, lambda: threading.Thread(target=self.check_update, daemon=True).start())
 
@@ -650,8 +916,6 @@ class Launcher:
                 value = self.ini.get(key, INI_DEFAULTS[key])
                 if key in INI_FLAGS:
                     v = tk.BooleanVar(value=value == '1')
-                elif key == 'sharpness':
-                    v = tk.DoubleVar(value=float(value or 0.5))
                 else:
                     v = tk.StringVar(value=value)
             else:
@@ -664,9 +928,154 @@ class Launcher:
             self.vars[key] = v
         return self.vars[key]
 
-    def choice(self, parent, key, store, options, width=30):
-        """A combobox over (value, (english, russian)) pairs, kept in sync with its variable."""
-        var = self.var(key, store)
+    def vsync_choice_var(self):
+        """VSync On / Off (the vsync key, also switched in the game) or a fixed present mode."""
+        if 'vsync_choice' not in self.vars:
+            vsync, mode = self.var('vsync', 'ini'), self.var('present_mode', 'ini')
+            current = mode.get() if mode.get() in ('immediate', 'fifo_relaxed') else \
+                'on' if mode.get() == 'fifo' else 'off' if mode.get() == 'mailbox' else \
+                'on' if vsync.get() else 'off'
+            choice = self.tk.StringVar(value=current)
+
+            def write(*_args):
+                value = choice.get()
+                if value in ('on', 'off'):
+                    mode.set('auto')
+                    vsync.set(value == 'on')
+                else:
+                    mode.set(value)
+            choice.trace_add('write', write)
+            choice.store = 'derived'  # saved through vsync and present_mode
+            self.vars['vsync_choice'] = choice
+            if mode.get() in ('fifo', 'mailbox'):  # older fixed modes that only duplicated the switch
+                write()
+        return self.vars['vsync_choice']
+
+    def engine_cap_var(self):
+        """Engine frame rate with "Unlimited" (present_no_frame_caps), kept in sync with both keys."""
+        if 'engine_cap' not in self.vars:
+            engine, caps = self.var('engine_fps', 'ini'), self.var('present_no_frame_caps', 'ini')
+            cap = self.tk.StringVar(value='unlimited' if caps.get() else engine.get())
+
+            def write(*_args):
+                unlimited = cap.get() == 'unlimited'
+                caps.set(unlimited)
+                if unlimited:
+                    engine.set('240')
+                else:
+                    engine.set(cap.get())
+            cap.trace_add('write', write)
+            cap.store = 'derived'  # saved through engine_fps and present_no_frame_caps
+            self.vars['engine_cap'] = cap
+        return self.vars['engine_cap']
+
+    def quality_choice_var(self):
+        """Graphics quality: the level every graphics setting matches (graphics_options.matched_level; the
+        picked level first, Deck Optimized while graphics_preset is deck), else 'custom', shown but not
+        picked. Picking a level sets every setting to its choice; Deck Optimized writes DECK_PRESET and turns
+        on the Deck switches; picking another level after it ends the preset and its switches."""
+        if 'quality_choice' not in self.vars:
+            quality, preset = self.var('ue4_quality', 'ini'), self.var('graphics_preset', 'app')
+            settings = {key: self.var(key, 'ini') for key in graphics_options.GRAPHICS_KEYS}
+
+            def shown():
+                picked = DECK_QUALITY if preset.get() == DECK_QUALITY else quality.get()
+                return graphics_options.matched_level({k: v.get() for k, v in settings.items()}, picked) or 'custom'
+            choice = self.tk.StringVar(value=shown())
+            busy, last = [False], [choice.get()]
+
+            def follow(*_args):  # a setting changed: the level it now matches, or Custom
+                if busy[0]:
+                    return
+                now = shown()
+                if now != choice.get():
+                    busy[0] = True
+                    try:
+                        choice.set(now)
+                    finally:
+                        busy[0] = False
+                last[0] = now
+
+            def pick(*_args):
+                value, previous = choice.get(), last[0]
+                last[0] = value
+                if busy[0] or value == previous or value == 'custom':
+                    return
+                busy[0] = True
+                try:
+                    if value == DECK_QUALITY:
+                        self.apply_deck_preset()
+                    else:
+                        if preset.get() == DECK_QUALITY:
+                            preset.set('')
+                            self.var('deck_switches', 'app').set(False)
+                        quality.set(value)
+                        for key, token in graphics_options.level_choices(value).items():
+                            settings[key].set(token)
+                finally:
+                    busy[0] = False
+                follow()
+            choice.trace_add('write', pick)
+            for var in settings.values():
+                var.trace_add('write', follow)
+            choice.store = 'derived'  # saved through ue4_quality, graphics_preset and the settings
+            self.vars['quality_choice'] = choice
+        return self.vars['quality_choice']
+
+    def apply_deck_preset(self):
+        """Deck Optimized: DECK_PRESET into the settings (saved to medievil.ini like any change) and the
+        Deck switches on; the VSync and engine frame rate lists follow their keys."""
+        for key, value in DECK_PRESET.items():
+            if key not in INI_DEFAULTS:  # the in-game menu's own keys (INI_OPTIONAL_KEYS)
+                self.ini[key] = value
+            elif key in INI_FLAGS:
+                self.var(key, 'ini').set(value == '1')
+            else:
+                self.var(key, 'ini').set(value)
+        mode = DECK_PRESET['present_mode']
+        self.vsync_choice_var().set(mode if mode in ('immediate', 'fifo_relaxed')
+                                    else 'on' if DECK_PRESET['vsync'] == '1' else 'off')
+        self.engine_cap_var().set('unlimited' if DECK_PRESET['present_no_frame_caps'] == '1'
+                                  else DECK_PRESET['engine_fps'])
+        self.var('graphics_preset', 'app').set(DECK_QUALITY)
+        self.var('deck_switches', 'app').set(True)
+
+    def offer_deck_preset(self):
+        """On a Steam Deck, once (deck_offered, saved with the other settings): the first run selects Deck
+        Optimized and says so, an existing setup is asked (deck_preset_offer)."""
+        action = deck_preset_offer(self.app, self.first_run, steam_deck())
+        if not action:
+            return
+        self.app['deck_offered'] = True
+        if action == 'select':
+            self.quality_choice_var().set(DECK_QUALITY)  # applies the preset (quality_choice_var)
+            self.messagebox.showinfo(APP_NAME, _('Steam Deck detected: the Deck Optimized graphics preset is '
+                                                 'selected (Graphics quality).') + '\n\n' + _(DECK_HINT))
+        elif self.messagebox.askyesno(APP_NAME, _('Steam Deck detected. Use the Deck Optimized graphics preset? '
+                                                  'It replaces your graphics settings; you can pick another '
+                                                  'Graphics quality later.') + '\n\n' + _(DECK_HINT)):
+            self.quality_choice_var().set(DECK_QUALITY)
+
+    def deck_note(self, parent):
+        """The Deck recommendation (DECK_HINT), shown while Deck Optimized is the graphics quality."""
+        label = self.ttk.Label(parent, text=_(DECK_HINT), style='Warning.TLabel', wraplength=self.px(640),
+                               justify='left')
+        choice = self.quality_choice_var()
+
+        def show(*_args):
+            if choice.get() == DECK_QUALITY:
+                label.grid()
+            else:
+                label.grid_remove()
+        choice.trace_add('write', show)
+        return label, show
+
+    def choice(self, parent, key, store, options, width=30, custom=None):
+        """A combobox over (value, (english, russian)) pairs, kept in sync with its variable (a key, or
+        a variable itself). custom: a label for a value the list does not have (kept, not reset)."""
+        var = key if store is None else self.var(key, store)
+        if custom and var.get() not in [v for v, _t in options]:
+            options = [*options, (var.get(), (custom(var.get()),))]
         values = [v for v, _t in options]
         box = self.ttk.Combobox(parent, values=[_(*text) for _v, text in options], state='readonly', width=width,
                                 font=self.f('body', 10))
@@ -675,11 +1084,59 @@ class Launcher:
 
         def show(*_args):
             current = var.get()
-            box.current(values.index(current) if current in values else 0)
+            if current in values:
+                box.current(values.index(current))
+            elif custom:  # set elsewhere (the render scale's percent box): shown, not reset
+                box.set(custom(current))
+            else:
+                box.current(0)
         show()
         box.bind('<<ComboboxSelected>>', lambda _e: var.set(values[box.current()]))
         var.trace_add('write', show)
         return box
+
+    def render_scale_control(self, parent):
+        """Render scale: the presets, or any whole percent in RENDER_SCALE_RANGE typed or stepped in the
+        box beside them (as the in-game menu's slider), and the scene size it gives at the output."""
+        ttk = self.ttk
+        holder = ttk.Frame(parent)
+        var, output = self.var('render_scale', 'ini'), self.var('output_resolution', 'ini')
+        self.choice(holder, 'render_scale', 'ini', RENDER_SCALE_CHOICES, width=26,
+                    custom=self.custom_label('render_scale')).pack(side='left')
+        low, high = graphics_options.RENDER_SCALE_RANGE
+        text = self.tk.StringVar(value=var.get())
+        ttk.Spinbox(holder, from_=low, to=high, increment=1, width=5, textvariable=text,
+                    font=self.f('body', 10)).pack(side='left', padx=(8, 0))
+        ttk.Label(holder, text='%').pack(side='left', padx=(2, 0))
+        size = ttk.Label(holder, style='Muted.TLabel')
+        size.pack(side='left', padx=(10, 0))
+
+        def from_text(*_args):  # only whole percents in the range reach medievil.ini
+            try:
+                value = int(text.get().strip())
+            except ValueError:
+                return
+            if low <= value <= high and str(value) != var.get():
+                var.set(str(value))
+
+        def from_setting(*_args):
+            if text.get().strip() != var.get():
+                text.set(var.get())
+            size.configure(text=render_scale_scene(output.get(), var.get()))
+        text.trace_add('write', from_text)
+        var.trace_add('write', from_setting)
+        output.trace_add('write', from_setting)
+        from_setting()
+        return holder
+
+    @staticmethod
+    def custom_label(key):
+        """The label of a value set in medievil.ini that a list does not offer."""
+        if key == 'output_resolution':
+            return lambda value: f'Custom ({value})'
+        if key == 'render_scale':
+            return lambda value: f'Custom ({value}%)'
+        return None
 
     def next_row(self, parent):
         return parent.grid_size()[1]
@@ -691,6 +1148,56 @@ class Launcher:
         if restart:
             self.ttk.Label(cell, text=_('applies at next start'), style='Restart.TLabel').pack(side='left', padx=(8, 0))
         return cell
+
+    def deck_switch_rows(self, parent):
+        """Steam Deck performance switches: the checkbox turns them all on (every one checked again); the
+        arrow shows them one by one (DECK_SWITCH_ITEMS, unchecked ones in deck_switches_off). On Windows
+        the ones that do nothing there are unchecked and greyed out, with the reason."""
+        ttk, top, off = self.ttk, self.var('deck_switches', 'app'), self.var('deck_switches_off', 'app')
+        holder = ttk.Frame(parent)
+        ttk.Checkbutton(holder, variable=top).pack(side='left')
+        arrow = ttk.Button(holder, text=_('Show the switches ▸'))
+        arrow.pack(side='left', padx=(12, 0))
+        self.row(parent, _('Steam Deck performance switches'), holder,
+                 _('Measured on the Steam Deck, applied at start; on with Deck Optimized. On Windows untested, '
+                   'and the Linux-only ones are left out.'), restart=True)
+        slot = ttk.Frame(parent)  # always in the grid, empty while the list is hidden
+        slot.grid(row=self.next_row(parent), column=0, columnspan=2, sticky='w', padx=(24, 0))
+        panel = ttk.Frame(slot)
+        boxes = {}
+        for i, (key, title, hint, _env, windows_reason) in enumerate(DECK_SWITCH_ITEMS):
+            dead = WINDOWS and windows_reason
+            item = self.tk.BooleanVar(value=not dead and key not in off.get().split(','))
+            text = _(title) + (' — ' + _('does nothing on Windows ({})').format(_(windows_reason)) if dead else '')
+            box = ttk.Checkbutton(panel, text=text, variable=item)
+            box.grid(row=2 * i, column=0, sticky='w', pady=(4, 0))
+            ttk.Label(panel, text=_(hint), style='Muted.TLabel', wraplength=self.px(600), justify='left').grid(
+                row=2 * i + 1, column=0, sticky='w', padx=(22, 0))
+            boxes[key] = (item, box, dead)
+
+        def write_off(*_args):
+            off.set(','.join(k for k, (v, _b, dead) in boxes.items() if not dead and not v.get()))
+
+        def follow_top(*_args):
+            if top.get():  # on: all of them again
+                for v, _b, dead in boxes.values():
+                    v.set(not dead)
+            for v, b, dead in boxes.values():
+                b.state(['disabled'] if dead or not top.get() else ['!disabled'])
+        for v, _b, _dead in boxes.values():
+            v.trace_add('write', write_off)
+        top.trace_add('write', follow_top)
+        for v, b, dead in boxes.values():
+            b.state(['disabled'] if dead or not top.get() else ['!disabled'])
+
+        def show_or_hide():
+            if panel.winfo_ismapped():
+                panel.pack_forget()
+                arrow.configure(text=_('Show the switches ▸'))
+            else:
+                panel.pack(anchor='w')
+                arrow.configure(text=_('Hide the switches ▾'))
+        arrow.configure(command=show_or_hide)
 
     def row(self, parent, title, widget, hint=None, restart=False):
         """Name on the left, control on the right, an optional note below."""
@@ -823,7 +1330,6 @@ class Launcher:
 
         self.pages = {}
         self.build_home()
-        self.build_graphics()
         self.build_display()
         self.build_performance()
         self.build_game()
@@ -892,8 +1398,6 @@ class Launcher:
             self.refresh_lists()
         if name == 'patches':
             self.refresh_game_patches()
-        elif name == 'graphics':
-            self.refresh_fsr4()
         elif name == 'home':
             self.refresh_status()
 
@@ -911,18 +1415,27 @@ class Launcher:
         self.section(quick, _('Quick settings', 'Основное'), top=0, columns=4)
         items = ((_('Display mode'), 'display_mode', 'ini', DISPLAY_MODES),
                  (_('Frame rate limit'), 'fps_limit', 'ini', FPS_LIMITS),
-                 (_('Render resolution'), 'render_resolution', 'ini', RESOLUTION_CHOICES),
-                 (_('Graphics quality'), 'ue4_quality', 'ini', QUALITY_CHOICES))
+                 (_('Output resolution'), 'output_resolution', 'ini', OUTPUT_CHOICES),
+                 (_('Render scale'), 'render_scale', 'ini', RENDER_SCALE_CHOICES),
+                 (_('Graphics quality'), self.quality_choice_var(), None, QUALITY_PRESETS),
+                 (_('VSync'), self.vsync_choice_var(), None, VSYNC_CHOICES))
         for index, (title, key, store, options) in enumerate(items):
             r, c = 2 + index // 2, (index % 2) * 2
             ttk.Label(quick, text=title).grid(row=r, column=c, sticky='w', pady=6, padx=(0, 12))
             quick.grid_rowconfigure(r, minsize=self.px(34))
-            self.choice(quick, key, store, options, width=18).grid(row=r, column=c + 1, sticky='w', padx=(0, 40))
+            # Graphics quality shows Custom when the settings match no level (shown, never reset to a level).
+            custom = (lambda _value: _('Custom')) if key is self.vars.get('quality_choice') else self.custom_label(key)
+            self.choice(quick, key, store, options, width=26, custom=custom).grid(
+                row=r, column=c + 1, sticky='w', padx=(0, 40))
         flags = ttk.Frame(quick)
-        flags.grid(row=4, column=0, columnspan=4, sticky='w', pady=(6, 0))
-        for key, title in (('vsync', _('VSync')), ('show_fps', _('Show performance overlay'))):
+        flags.grid(row=2 + (len(items) + 1) // 2, column=0, columnspan=4, sticky='w', pady=(6, 0))
+        # VSync is the present mode above (its first choice follows the in-game VSync switch).
+        for key, title in (('show_fps', _('Show performance overlay')),):
             ttk.Checkbutton(flags, text=title, variable=self.var(key, 'ini')).pack(side='left', padx=(0, 28))
         self.link_buttons(quick).grid(row=5, column=0, columnspan=4, sticky='w', pady=(14, 0))
+        note, show = self.deck_note(quick)
+        note.grid(row=6, column=0, columnspan=4, sticky='w', pady=(12, 0))
+        show()
 
     def link_buttons(self, parent):
         """GitHub, YouTube and Patreon buttons that open the port's pages in the browser."""
@@ -980,72 +1493,58 @@ class Launcher:
             factor = max(1, round(self.banner_image.width() / max(width, 1)))
             return self.banner_image.subsample(factor) if factor > 1 else self.banner_image
 
-    def build_graphics(self):
-        """Temporal upscalers: not calibrated for this game yet (run.py turns them off), so this page
-        stays out of the menu."""
-        ttk = self.ttk
-        f = self.scrolled_page('graphics', _('Graphics', 'Графика'),
-                               _('Stored in medievil.ini; the in-game menu (Insert or R3+L2) changes the same values.',
-                                 'Хранится в medievil.ini; в игре меняется через меню (Insert или R3+L2).'))
-        self.section(f, _('Upscaling', 'Апскейлинг'), top=4)
-        self.row(f, _('Upscaler', 'Апскейлер'), self.choice(f, 'upscaler', 'ini', UPSCALERS),
-                 _("Temporal upscaling with the game's own motion vectors. FSR 4 needs its assets (below) and "
-                   'a GPU with INT8 dot products; otherwise the game falls back to FSR 3.1 by itself.',
-                   'Временной апскейлинг с векторами движения игры. FSR 4 нужны ассеты (ниже) и GPU с INT8; '
-                   'иначе игра сама переключится на FSR 3.1.'))
-        self.row(f, _('Quality preset', 'Пресет'), self.choice(f, 'preset', 'ini', PRESETS),
-                 _('Render scale per axis: Quality renders at 1/1.5 of the output size.',
-                   'Масштаб рендера по каждой оси: Quality рисует в 1/1.5 размера вывода.'))
-        self.row(f, _('Output resolution', 'Разрешение вывода'), self.choice(f, 'output_res', 'ini', OUTPUTS),
-                 _('What the upscaler produces; the HUD is drawn at this size too.',
-                   'Что выдаёт апскейлер; интерфейс рисуется в этом же размере.'))
-        self.row(f, _('Live resolution changes', 'Смена разрешения на лету'), self.choice(f, 'live_resolution', 'ini', LIVE),
-                 _('Off: outputs other than 1080p are set by a patch at start (fastest; changing them in the '
-                   'game restarts it). On: change output and preset in the game without a restart, at a cost.',
-                   'Выкл.: разрешения кроме 1080p задаются патчем при запуске (быстрее). Вкл.: менять в игре '
-                   'без перезапуска, но медленнее.'))
-        self.check(f, 'sharpen', 'ini', _('Sharpening (RCAS)', 'Резкость (RCAS)'))
-        holder = ttk.Frame(f)
-        ttk.Scale(holder, from_=0.0, to=2.0, variable=self.var('sharpness', 'ini'), length=300).pack(side='left')
-        value = ttk.Label(holder, width=5)
-        value.pack(side='left', padx=10)
-        show = lambda *_a: value.configure(text=f'{self.vars["sharpness"].get():.2f}')
-        self.vars['sharpness'].trace_add('write', show)
-        show()
-        self.row(f, _('Sharpness', 'Сила резкости'), holder)
-        self.check(f, 'object_motion', 'ini', _('Object motion vectors', 'Векторы движения объектов'),
-                   _('Less ghosting on characters, cloth and weapons; costs about 10% FPS.',
-                     'Меньше гостинга на персонажах и одежде; стоит около 10% FPS.'))
-        self.section(f, _('FSR 4 assets', 'Ассеты FSR 4'))
-        self.fsr4_label = ttk.Label(f, text='', wraplength=self.px(640), justify='left')
-        self.fsr4_label.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w')
-        holder = ttk.Frame(f)
-        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(8, 0))
-        self.fsr4_button = ttk.Button(holder, text=_('Download FSR 4 assets', 'Скачать ассеты FSR 4'),
-                                      command=self.download_fsr4)
-        self.fsr4_button.pack(side='left')
-        self.fsr4_progress = ttk.Progressbar(holder, length=280, maximum=len(fsr4_files()))
-        self.fsr4_progress.pack(side='left', padx=12)
-        self.note(f, _("From FireBurn/Q2RTX on GitHub (built from AMD's MIT-licensed FidelityFX source), "
-                       'about 30 MB, into the fsr4_shaders folder of the port.',
-                       'С GitHub FireBurn/Q2RTX (собраны из MIT-исходников AMD FidelityFX), около 30 МБ, '
-                       'в папку fsr4_shaders порта.'), top=6)
-
     def build_display(self):
         tk, ttk = self.tk, self.ttk
-        f = self.scrolled_page('display', _('Display'), _('How the game appears on your screen.'))
+        f = self.scrolled_page('display', _('Display'), _('How the game appears on your screen, and its frame rate.'))
         self.section(f, _('Window', 'Окно'), top=4)
         self.row(f, _('Display mode'), self.choice(f, 'display_mode', 'ini', DISPLAY_MODES),
                  _('Borderless covers the screen without changing the display mode.'))
-        self.check(f, 'vsync', 'ini', _('VSync'), _('Off allows tearing for the lowest latency.'))
+        self.row(f, _('VSync'), self.choice(f, self.vsync_choice_var(), None, VSYNC_CHOICES), _(VSYNC_HINT),
+                 restart=True)
         self.check(f, 'hdr', 'app', _('Allow HDR output', 'Разрешить HDR'),
                    _('When HDR is on in Windows and the display supports it.',
                      'Если HDR включён в Windows и монитор его поддерживает.'))
+        self.section(f, _('Frame rate', 'Частота кадров'))
+        self.row(f, _('Engine frame rate'), self.choice(f, self.engine_cap_var(), None, ENGINE_CAP_CHOICES),
+                 _('The highest frame rate MediEvil runs at. The PS4 game stops at 60; 120 and 240 lift '
+                   'that limit; Unlimited also removes the port\'s own caps (only Frame rate limit applies). '
+                   'Applied at start.'), restart=True)
+        self.row(f, _('Frame rate limit'), self.choice(f, 'fps_limit', 'ini', FPS_LIMITS),
+                 _('The Auto choices follow your display: with G-Sync / FreeSync they stay just below the refresh '
+                   '("Auto: half refresh" = 119 FPS on 240 Hz; "Auto: refresh" = NVIDIA Reflex\'s caps, 138 on '
+                   '144 Hz, 225 on 240 Hz; a cap exactly at half the refresh flickered on a 240 Hz OLED); on a '
+                   'fixed-refresh display they are exactly the refresh or half of it (use VSync on).'))
+        self.check(f, 'display_vrr', 'ini', _('G-Sync / FreeSync display (VRR)'),
+                   _('On: the automatic frame rate limits stay just below the refresh. Off: a fixed-refresh '
+                     'display, where they match the refresh exactly.'))
+        self.row(f, _('Frame limiter'), self.choice(f, 'present_limiter', 'ini', PRESENT_LIMITERS),
+                 _('NVIDIA Reflex: the graphics driver paces the frames (as RTSS\'s Reflex limiter does): the '
+                   'most even frame times. Falls back to Precise on AMD and Intel. Precise: the port\'s own '
+                   'high-resolution limiter. Standard: the original limiter.'), restart=True)
+        self.row(f, _('Frames queued'), self.choice(f, 'frames_queued', 'ini', FRAMES_QUEUED),
+                 _('1 is the lowest input latency; more can raise FPS when the graphics card is the limit.'))
+        self.section(f, _('Advanced presentation'))
+        self.note(f, _('How finished frames reach the screen. The defaults are the tested best; change them '
+                       'to compare. Applied at the next start.'), top=2)
+        tick = self.ttk.Spinbox(f, from_=0, to=2000, increment=1, width=8, font=self.f('body', 10),
+                                textvariable=self.var('present_tick_hz', 'ini'))
+        self.row(f, _('Vblank tick rate (Hz)'), tick,
+                 _('How often the game\'s virtual vblank fires (default 960): the PS4 game waits for it before '
+                   'each frame. 0 = automatic (480 Hz above 60 FPS, else 60). A rate at or below the frame rate '
+                   'limit paces the game by itself (120 = 120 FPS) and rounds slow frames up to whole ticks.'),
+                 restart=True)
+        for key, title, hint in PRESENT_SWITCHES:
+            self.check(f, key, 'ini', _(title), _(hint), restart=True)
         self.section(f, _('Scaling and sharpening'))
         self.check(f, 'fsr1', 'ini', _('Upscale with FSR 1'),
                    _('Enlarges a smaller game image to the window. With Render resolution 720p (Performance) '
                      'it raises the FPS; at the size of the window it does nothing.'))
-        self.check(f, 'rcas', 'ini', _('Sharpening (RCAS)'))
+        self.check(f, 'rcas', 'ini', _('Final image sharpening (RCAS)'))
+        self.check(f, 'ue4_dlss', 'ini', _('NVIDIA DLSS (replaces the game\'s anti-aliasing)'),
+                   _('DLAA at Render scale 100, DLSS upscaling below it (Quality / Balanced / Performance from '
+                     'the scale). Sharpening is off while it runs. Needs an NVIDIA RTX GPU and gow3_dlss.dll + '
+                     'nvngx_dlss.dll next to medievil-runtime.exe (the bin folder; nvngx_dlss.dll is not included: see '
+                     'README-Windows.txt). F9 switches it in the game.'))
         holder = ttk.Frame(f)
         strength = self.var('rcas_strength', 'ini')
         tk.Scale(holder, from_=0, to=100, orient='horizontal', variable=strength, showvalue=False, length=self.px(260),
@@ -1069,38 +1568,46 @@ class Launcher:
                   style='Muted.TLabel').pack(side='left', padx=10)
 
     def build_performance(self):
-        f = self.scrolled_page('performance', _('Performance'), _('Frame rate and speed options.'))
-        self.section(f, _('Frame rate', 'Частота кадров'), top=4)
-        self.row(f, _('Engine frame rate'), self.choice(f, 'engine_fps', 'ini', ENGINE_FPS_CHOICES),
-                 _('The highest frame rate MediEvil runs at. 60 is the PS4 original and the recommended '
-                   'setting. 120 and 240 are experimental: they lift that limit, but can stutter and '
-                   'need a fast CPU (also set Frame rate limit to Unlimited or higher). Applied at start.'),
-                 restart=True)
-        self.row(f, _('Frame rate limit'), self.choice(f, 'fps_limit', 'ini', FPS_LIMITS),
-                 _('Caps the frame rate below the engine frame rate; a lower limit saves power. "Half display '
-                   'refresh" shows every frame for exactly two refreshes of your screen (for example 72 FPS on '
-                   '144 Hz): the smoothest picture, with Engine frame rate 120.'))
-        self.row(f, _('Frames queued'), self.choice(f, 'frames_queued', 'ini', FRAMES_QUEUED),
-                 _('1 is the lowest input latency; more can raise FPS when the graphics card is the limit.'))
+        f = self.scrolled_page('performance', _('Performance'), _('Graphics and speed options.'))
+        self.section(f, _('Graphics settings'), top=4)
+        self.note(f, _('Graphics quality (below) sets all of these; changing one makes it Custom. "PS4 default" '
+                       'marks the value the PS4 itself uses. The in-game menu switches most of them while playing.'),
+                  top=2)
+        for key, title, hint, choices in GRAPHICS_OPTIONS:
+            self.row(f, _(title), self.choice(f, key, 'ini', [(value, (label,)) for value, label in choices]),
+                     _(hint), restart=True)
+        self.section(f, _('Performance patches'))
+        self.note(f, _('On by default except the single particle pass. Switch one off to compare, or if '
+                       'something looks wrong; applied at the next start.'), top=2)
+        for key, title, hint, _off in PERF_PATCHES:
+            self.check(f, key, 'ini', _(title), _(hint), restart=True)
         self.section(f, _('Resolution and quality'))
-        self.row(f, _('Graphics quality'), self.choice(f, 'ue4_quality', 'ini', QUALITY_CHOICES),
-                 _('High and Ultra go beyond the PS4: sharper, longer-range shadows, better reflections and more distant detail, for strong graphics cards. Console keeps the PS4 look. Low turns off volumetric fog, reflections and ambient occlusion '
-                   'and lowers shadows and view distance: for integrated graphics (Radeon 780M, Intel Arc) and '
-                   'older cards. Applied at start.'), restart=True)
-        self.row(f, _('Render resolution'), self.choice(f, 'render_resolution', 'ini', RESOLUTION_CHOICES),
-                 _('720p to 4K: the 3D scene is drawn at that size and scaled to the game\'s 1080p picture (4K: '
-                   'much sharper edges and detail on a 1080p screen). "Native output": the game itself runs at '
-                   'that size, pixel for pixel on a 1440p or 4K display or TV. Applied at start (the in-game '
-                   'menu restarts the game for it).'), restart=True)
+        self.row(f, _('Graphics quality'), self.choice(f, self.quality_choice_var(), None, QUALITY_PRESETS,
+                                                       custom=lambda _value: _('Custom')),
+                 _('Sets every graphics setting above. Console: exactly the PS4. High and Ultra go beyond it: '
+                   'sharper filtering, farther view and detail, better reflections, for strong graphics cards. Medium '
+                   'and Low lower shadows, effects and distances: for integrated graphics (Radeon 780M, Intel Arc) '
+                   'and older cards. Custom: some settings changed by hand.') + ' ' +
+                 _('Deck Optimized: the Steam Deck settings of a flat 60 FPS (720p, 80% render scale, Low with '
+                   'volumetric fog, a 60 FPS limit, VSync off) and the Steam Deck performance switches below.'),
+                 restart=True)
+        note, show = self.deck_note(f)
+        note.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(4, 2))
+        show()
+        self.deck_switch_rows(f)
+        self.row(f, _('Effects resolution'), self.choice(f, 'effects_resolution', 'ini', EFFECTS_CHOICES),
+                 _('Smoke, fire and enemy death effects drawn at a lower resolution and blended in. At 4K '
+                   'several enemy deaths at once cost 2-3 ms a frame at 100%; 50% matches the effect detail '
+                   'of the PS4 at 1080p. The cost grows with the render resolution. Applied at start; the in-game menu '
+                   'also switches it while playing.'), restart=True)
+        self.row(f, _('Output resolution'), self.choice(f, 'output_resolution', 'ini', OUTPUT_CHOICES,
+                                                        custom=self.custom_label('output_resolution')),
+                 _(OUTPUT_HINT), restart=True)
+        self.row(f, _('Render scale'), self.render_scale_control(f), _(RENDER_SCALE_HINT), restart=True)
         self.row(f, _('Anti-aliasing'), self.choice(f, 'ue4_aa', 'ini', AA_CHOICES),
                  _("The game's temporal AA smooths edges but blurs a little in motion. FXAA is sharper, Off "
-                   'shows raw pixels (best with a high render resolution). Upscaling always uses temporal AA. '
-                   'Applied at start.'), restart=True)
-        self.row(f, _('Upscaling (native output)'), self.choice(f, 'ue4_upscale', 'ini', UPSCALE_CHOICES),
-                 _("The game's own temporal upscaler: the 3D scene is drawn at a lower scale and rebuilt at full "
-                   'size from its motion vectors (like FSR 2). For the native output modes and Native 1080p on '
-                   'slower graphics cards; Quality looks close to full resolution. Applied at start.'),
-                 restart=True)
+                   'shows raw pixels (best with a render scale above 100%). A render scale below 100% always '
+                   'uses temporal AA. Applied at start.'), restart=True)
         self.section(f, _('Shaders'))
         self.check(f, 'pipeline_binary_cache', 'app', _('Use pipeline binary cache (A/B test)'),
                    _('Reuse saved Vulkan pipelines. Disable to compare FPS with normal compilation. '
@@ -1121,6 +1628,12 @@ class Launcher:
                    _('Fewer waits for the GPU. Switch it off if textures or shadows look wrong.'), restart=True)
         self.row(f, _('Two-stage GPU pipeline', 'Двухстадийный конвейер GPU'), self.choice(f, 'draw_pipe', 'app', DRAW_PIPE),
                  _('20–30% faster; switch it off if the game is unstable.', 'Быстрее на 20–30%; при нестабильности выключите.'))
+        self.row(f, _('Draw preparation helpers'), self.choice(f, 'prep_workers', 'app', PREP_WORKERS),
+                 _('Threads that prepare draws ahead of the GPU thread. Fewer can help on CPUs with few cores '
+                   '(Steam Deck: 4). Applied at start.'))
+        self.check(f, 'stage_b_core', 'app', _('Dedicated core for the GPU thread'),
+                   _('Gives the thread that records draws a CPU core of its own; every other thread uses the '
+                     'remaining cores. Experimental. Applied at start.'))
         self.row(f, _('GPU readbacks', 'Чтение данных GPU'), self.choice(f, 'readbacks', 'app', READBACKS),
                  _('How exactly data the GPU writes is copied back for the game.',
                    'Насколько точно данные, записанные GPU, возвращаются игре.'))
@@ -1153,10 +1666,11 @@ class Launcher:
                  _('The spoken language: 15 are in the game. "Same as game language" follows the game '
                    'language (English voices for languages without a dub). Applied at start.'), restart=True)
         self.section(f, _('Cheats'))
-        self.check(f, 'cheat_menu', 'ini', _('Developer cheat menu (R3 in the game)'),
+        self.check(f, 'cheat_menu', 'ini', _('Developer cheat menu (R3 in a level)'),
                    _("MediEvil's own debug menu, left in the game by its developers: level select, complete "
                      'level, weapons and items for the level, runes, gold, life bottles and more. Press R3 '
-                     '(click the right stick) during play. Applied at start.'))
+                     '(click the right stick) in a level; on 01.02 hold L1 + R1, then press R3. '
+                     'Applied at start.'))
         self.check(f, 'cheat_infinite_ammo', 'ini', _('Unlimited ammo'),
                    _('Daggers, crossbow and longbow bolts, lightning and the other weapons never run out, and '
                      'weapons and shields do not wear out. Applied at start.'))
@@ -1298,7 +1812,6 @@ class Launcher:
 
     def refresh_game_patches(self):
         import xml.etree.ElementTree as ET
-        from patches import EXCLUSIVE_PREFIX
         tk, f = self.tk, self.game_patch_frame
         self.store_game_patches()
         for widget in f.winfo_children():
@@ -1312,14 +1825,16 @@ class Launcher:
             return
         _ids, xml, version = profile[:3]
         metas = [m for m in ET.parse(xml).getroot().iter('Metadata') if m.get('AppVer') == version]
-        chosen = self.app.get('game_patches', {}).get(title_id)
+        chosen = game_patch_selection(self.app, title_id, profile)
         on = set(chosen) if chosen is not None else {m.get('Name') for m in metas
                                                          if m.get('isEnabled', 'false').lower() == 'true'}
         self.note(f, _('{} · version {} · {}. Resolution and frame rate patches follow Performance.',
                        '{} · версия {} · {}.').format(title_id, version, xml.name), top=0)
         for meta in metas:
             name = meta.get('Name')
-            if name.startswith(EXCLUSIVE_PREFIX) or name.startswith('Frame Rate Patch'):
+            # Chosen by run.py: the resolution and frame rate patches, and the output size ones
+            # (Performance > Output resolution).
+            if chosen_by_run_py(name):
                 continue
             var = tk.BooleanVar(value=name in on)
             self.game_patch_vars[name] = var
@@ -1334,6 +1849,9 @@ class Launcher:
             return
         self.app.setdefault('game_patches', {})[self.game_patch_title] = \
             [n for n, v in self.game_patch_vars.items() if v.get()]
+        # What the page showed: a default patch added later starts on (game_patch_selection).
+        seen = self.app.setdefault('game_patches_seen', {})
+        seen[self.game_patch_title] = sorted(set(seen.get(self.game_patch_title, [])) | set(self.game_patch_vars))
 
     def build_mods(self):
         f = self.scrolled_page('mods', _('Mods', 'Моды'),
@@ -1444,6 +1962,9 @@ class Launcher:
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Desktop shortcut', 'Ярлык на рабочем столе'), command=self.shortcut).pack(side='left')
+        if WINDOWS:  # on Linux the desktop shortcut also adds the application menu entry
+            ttk.Button(holder, text=_('Start menu shortcut', 'Ярлык в меню «Пуск»'),
+                       command=lambda: self.shortcut('Programs')).pack(side='left', padx=(8, 0))
         ttk.Button(holder, text=_('Check for updates', 'Проверить обновления'),
                    command=lambda: threading.Thread(target=self.check_update, args=(True,), daemon=True).start()).pack(
             side='left', padx=(8, 0))
@@ -1476,6 +1997,8 @@ class Launcher:
                    _('Shows where the frame waits for the GPU and which reads cause it. For performance tests.'))
         self.check(body, 'frame_capture_key', 'app', _('F11 captures a frame for analysis'),
                    _('Records how the next frame is drawn into the captures folder.'))
+        key, title, hint = FRAME_TRACE
+        self.check(body, key, 'ini', _(title), _(hint), restart=True)
         self.check(body, 'vk_validation', 'app', _('Vulkan validation layers (needs the Vulkan SDK; much slower)',
                                                    'Слои валидации Vulkan (нужен Vulkan SDK; сильно замедляет)'))
         shown = tk.BooleanVar(value=False)
@@ -1537,48 +2060,16 @@ class Launcher:
         mode = dict((v, t[0]) for v, t in DISPLAY_MODES).get(self.var('display_mode', 'ini').get(), '?')
         limit = self.var('fps_limit', 'ini').get()
         engine = self.var('engine_fps', 'ini').get()
-        resolution = dict((v, t[0]) for v, t in RESOLUTION_CHOICES).get(self.var('render_resolution', 'ini').get(), '?')
+        output = self.var('output_resolution', 'ini').get()
+        resolution = dict((v, t[0]) for v, t in OUTPUT_CHOICES).get(output, output)
+        if (scale := self.var('render_scale', 'ini').get()) != '100':
+            resolution = f'{_(resolution)}, {scale}% scale'
         return _('{} · {} · {} · VSync {}').format(
             _(mode), _(resolution), _('half display refresh') if limit == '-1'
+            else _('auto (refresh)') if limit == '-2' else _('auto (half refresh)') if limit == '-3'
             else _('up to {} FPS').format(engine) if limit == '0' or int(limit) >= int(engine)
             else _('{} FPS').format(limit),
             _('on') if self.var('vsync', 'ini').get() else _('off'))
-
-    def refresh_fsr4(self):
-        total, missing = len(fsr4_files()), len(fsr4_missing())
-        self.fsr4_progress.configure(value=total - missing)
-        self.fsr4_label.configure(
-            text=_('Installed: {} files in {}.', 'Установлены: {} файлов в {}.').format(total, PORT_DIR / 'fsr4_shaders')
-            if not missing else _('{} of {} files missing in {}.', 'Нет {} из {} файлов в {}.').format(
-                missing, total, PORT_DIR / 'fsr4_shaders'))
-        self.fsr4_button.configure(state='normal' if missing and not self.downloading else 'disabled')
-
-    def download_fsr4(self):
-        self.downloading = True
-        self.fsr4_button.configure(state='disabled')
-        folder = PORT_DIR / 'fsr4_shaders'
-
-        def work():
-            error = None
-            try:
-                folder.mkdir(parents=True, exist_ok=True)
-                for name in fsr4_missing():
-                    part = folder / (name + '.part')
-                    with urllib.request.urlopen(f'{FSR4_BASE}/{name}', timeout=60) as response:
-                        part.write_bytes(response.read())
-                    part.replace(folder / name)
-                    self.ui_calls.put(self.refresh_fsr4)
-            except OSError as failure:
-                error = failure
-
-            def done():
-                self.downloading = False
-                self.refresh_fsr4()
-                self.refresh_status()
-                if error:
-                    self.messagebox.showerror('FSR 4', _('Download failed: {}', 'Не удалось скачать: {}').format(error))
-            self.ui_calls.put(done)
-        threading.Thread(target=work, daemon=True).start()
 
     def refresh_lists(self):
         if not hasattr(self, 'patches_frame'):
@@ -1695,13 +2186,14 @@ class Launcher:
         """Writes settings.json, medievil.ini, mods.json and patches.json."""
         self.store_game_patches()
         for key, var in self.vars.items():
+            if var.store == 'derived':
+                continue
             try:
                 value = var.get()
             except self.tk.TclError:  # an unfinished number in a spinbox
                 value = APP_DEFAULTS.get(key, INI_DEFAULTS.get(key))
             if var.store == 'ini':
-                self.ini[key] = ('1' if value else '0') if key in INI_FLAGS else \
-                    f'{float(value):.2f}' if key == 'sharpness' else str(value)
+                self.ini[key] = ('1' if value else '0') if key in INI_FLAGS else str(value)
             else:
                 self.app[key] = value
         self.app['controls'] = {kind: control_changes({b: v.get() for b, v in vars_.items()}, kind)
@@ -1709,8 +2201,10 @@ class Launcher:
         self.app['pad_style'] = self.pad_style.get()
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(self.app, indent=2, ensure_ascii=False), encoding='utf-8')
-        save_ini({key: self.ini[key] for key in INI_DEFAULTS}, self.ini_lines)
+        save_ini({key: self.ini[key] for key in (*INI_DEFAULTS, *INI_OPTIONAL_KEYS) if key in self.ini},
+                 self.ini_lines)
         self.ini, self.ini_lines = load_ini()
+        self.ini.update(graphics_options.graphics_migration(self.ini))  # older tokens, "preset", new keys
         if self.mod_order:
             (DATA_DIR / 'mods.json').write_text(json.dumps(
                 {'order': self.mod_order, 'disabled': [n for n, v in self.mod_vars.items() if not v.get()]},
@@ -1943,11 +2437,7 @@ class Launcher:
         icon = CONFIG_DIR / 'medievil.png'
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            for source in (Path(self.app.get('game_dir') or '.') / 'sce_sys' / 'icon0.png',
-                           PORT_DIR / 'launcher' / 'medievil.png'):
-                if source.is_file():
-                    shutil.copyfile(source, icon)
-                    break
+            shutil.copyfile(PORT_DIR / 'launcher' / 'medievil.png', icon)
             entry = ('[Desktop Entry]\nType=Application\nName=MediEvil\nComment=MediEvil (PS4) for PC\n'
                      f'Exec={command}\nIcon={icon}\nTerminal=false\nCategories=Game;\n')
             data_home = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local' / 'share')
@@ -1964,24 +2454,24 @@ class Launcher:
             return
         self.messagebox.showinfo(APP_NAME, _('Shortcut created on the desktop.', 'Ярлык создан на рабочем столе.'))
 
-    def shortcut(self):
-        """MediEvil.lnk on the desktop."""
+    def shortcut(self, folder='Desktop'):
+        """MediEvil.lnk on the desktop, or in the Start menu (folder 'Programs': the user's
+        Start Menu\\Programs, where Windows search finds it), with the game icon."""
         if not WINDOWS:
             return self.linux_shortcut()
         if FROZEN:
-            target, arguments, icon = sys.executable, '', f'{sys.executable},0'
+            target, arguments = sys.executable, ''
         else:  # a source tree: the launcher script with the windowless Python
             pythonw = Path(sys.executable).with_name('pythonw.exe')
             target = str(pythonw if pythonw.exists() else sys.executable)
-            arguments, icon = Path(__file__).resolve(), PORT_DIR / 'launcher' / 'medievil.ico'
-        script = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath("Desktop")'
-                  '+"\\MediEvil.lnk");'
-                  f'$s.TargetPath="{target}";$s.WorkingDirectory="{PORT_DIR}";$s.IconLocation="{icon}";'
-                  + (f"$s.Arguments='\"{arguments}\"';" if arguments else '') + '$s.Save()')
-        result = subprocess.run(['powershell', '-NoProfile', '-Command', script], capture_output=True,
-                                creationflags=NO_WINDOW)
+            arguments = Path(__file__).resolve()
+        icon = PORT_DIR / 'launcher' / 'medievil.ico'
+        result = subprocess.run(['powershell', '-NoProfile', '-Command', shortcut_script(folder, target, arguments, icon)],
+                                capture_output=True, creationflags=NO_WINDOW)
         if result.returncode == 0:
-            self.messagebox.showinfo(APP_NAME, _('Shortcut created on the desktop.', 'Ярлык создан на рабочем столе.'))
+            self.messagebox.showinfo(APP_NAME, _('Shortcut created in the Start menu.', 'Ярлык создан в меню «Пуск».')
+                                     if folder == 'Programs' else
+                                     _('Shortcut created on the desktop.', 'Ярлык создан на рабочем столе.'))
         else:
             self.messagebox.showerror(APP_NAME, result.stderr.decode(errors='replace')[:400])
 
@@ -2044,6 +2534,15 @@ def play_without_window(settings):
             except (OSError, ValueError):
                 pass
         return process.wait()
+
+
+def shortcut_script(folder, target, arguments, icon):
+    """PowerShell that saves MediEvil.lnk in a special folder ('Desktop', 'Programs' = Start menu)."""
+    return ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut('
+            f'[Environment]::GetFolderPath("{folder}")+"\\MediEvil.lnk");'
+            f'$s.TargetPath="{target}";$s.WorkingDirectory="{PORT_DIR}";$s.IconLocation="{icon}";'
+            '$s.Description="MediEvil (PS4) for PC";'
+            + (f"$s.Arguments='\"{arguments}\"';" if arguments else '') + '$s.Save()')
 
 
 def version_tuple(text):

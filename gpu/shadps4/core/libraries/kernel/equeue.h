@@ -86,6 +86,7 @@ struct EqueueEvent {
     OrbisKernelEvent event;
     void* data = nullptr;
     std::chrono::steady_clock::time_point time_added;
+    u64 triggered_ns = 0; ///< gow3 GOW3_FRAME_STATS: when it was last triggered (gow3_fence_stats.h)
     std::chrono::nanoseconds timer_interval;
     std::unique_ptr<boost::asio::steady_timer> timer;
 

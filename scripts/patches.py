@@ -35,6 +35,33 @@ def eboot_segments(elf):
     return segments
 
 
+def eboot_bytes(elf, offset, length):
+    """length bytes of the eboot file at image offset `offset` (vaddr - EBOOT_BASE), None when they
+    are not all in one loaded segment's file data."""
+    phoff,=struct.unpack_from('<Q',elf,0x20)
+    phentsize,phnum=struct.unpack_from('<HH',elf,0x36)
+    for i in range(phnum):
+        kind,_,fileoff,vaddr,_,filesz,_,_=struct.unpack_from('<IIQQQQQQ',elf,phoff+i*phentsize)
+        if kind==1 and vaddr<=offset and offset+length<=vaddr+filesz:
+            return bytes(elf[fileoff+offset-vaddr:fileoff+offset-vaddr+length])
+    return None
+
+
+def original_mismatches(xml, names, app_version, elf):
+    """The selected patches with a line whose Original attribute (the bytes the line replaces,
+    optional, this port's addition to the format) differs from the eboot's bytes there."""
+    bad=[]
+    for meta in ET.parse(xml).getroot().iter('Metadata'):
+        if meta.get('AppVer')!=app_version or meta.get('Name') not in names: continue
+        for line in meta.iter('Line'):
+            if line.get('Original') is None: continue
+            original=bytes.fromhex(line.get('Original').replace(' ',''))
+            if eboot_bytes(elf,int(line.get('Address'),0)-EBOOT_BASE,len(original))!=original:
+                bad.append(meta.get('Name'))
+                break
+    return bad
+
+
 def encode(line):
     kind,value=line.get('Type'),line.get('Value')
     if kind=='bytes': return bytes.fromhex(value.replace(' ',''))
@@ -47,18 +74,39 @@ def encode(line):
     raise ValueError(f'unsupported patch type {kind!r}')
 
 
+# A sized patch, "<name> WxH": the entry <name> with Type="size" lines, each written as W and H
+# (two little-endian int32), e.g. "Boot display size 2560x1440" (MediEvil.xml).
+SIZED=re.compile(r'(.+) (\d+)x(\d+)$')
+
+
+def sized_patch(name):
+    """(entry name, width, height) of a sized patch name, else (name, None, None)."""
+    m=SIZED.match(name)
+    return (m.group(1),int(m.group(2)),int(m.group(3))) if m else (name,None,None)
+
+
 def compile_patches(xml, names, app_version, segments):
     found={}
     for meta in ET.parse(xml).getroot().iter('Metadata'):
-        if meta.get('Name') in names and meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
+        if meta.get('AppVer')==app_version and meta.get('AppElf','eboot.bin')=='eboot.bin':
             found[meta.get('Name')]=meta
-    missing=[n for n in names if n not in found]
+    def entry(name):
+        if name in found: return found[name],None
+        base,w,h=sized_patch(name)
+        meta=found.get(base) if w else None
+        return (meta,(w,h)) if meta is not None and any(l.get('Type')=='size' for l in meta.iter('Line')) else (None,None)
+    missing=[n for n in names if entry(n)[0] is None]
     if missing: raise ValueError(f'patches not found for app version {app_version}: {missing}')
     writes=[]
     for name in names:
-        for line in found[name].iter('Line'):
+        meta,size=entry(name)
+        for line in meta.iter('Line'):
             offset=int(line.get('Address'),0)-EBOOT_BASE
-            data=encode(line)
+            if line.get('Type')=='size':
+                if not size: raise ValueError(f'{name}: needs a size ("{name} WxH")')
+                data=struct.pack('<ii',*size)
+            else:
+                data=encode(line)
             if not any(start<=offset and offset+len(data)<=end for start,end in segments):
                 raise ValueError(f'{name}: address {line.get("Address")} is outside the eboot')
             writes.append((offset,data))
@@ -72,11 +120,14 @@ PATCHES_DIR=Path(__file__).resolve().parent.parent/'patches'
 # MediEvil, America and Europe: only the analysed eboots (sha256) get these patches.
 GAMES=[({'CUSA11227','CUSA12982'},PATCHES_DIR/'MediEvil.xml','01.00',
         'a7e976d13b9649c5cd1ccb617b02f4a27b95c45b9f5331470b90a1f014c3b828'),
-       # 01.02 exists as at least two eboot builds with the patched code at the same addresses
-       # (e50c9b36: the dump of PR #26; cd273b59: the European CUSA12982 update, 29 Oct 2026).
+       # 01.02 exists as at least three eboot builds with the patched code at the same addresses
+       # (e50c9b36: the dump of PR #26; cd273b59: the European CUSA12982 update, 29 Oct 2026;
+       # fe2f88ba: unpacked from the US update PKG UP9000-CUSA11227_00-MEDIEVILHD000001-A0102-V0100,
+       # every patched and hooked site checked, research/docs/plan-0102.md).
        ({'CUSA11227','CUSA12982'},PATCHES_DIR/'MediEvil.xml','01.02',
         ('e50c9b36153416949d377ad0ddafac1a888c119987095615dc0f69b5ad15e401',
-         'cd273b59a2220ecec970434edf022ff03aa298851dae28b0460814a996ff5634'))]
+         'cd273b59a2220ecec970434edf022ff03aa298851dae28b0460814a996ff5634',
+         'fe2f88baaa97f19c34047b8ec0c9bd41e29cc818f6b72e9e21fafe66a8d01b00'))]
 DMEM_RETAIL_MB=5056  # runtime_memory.c POOL_SIZE default
 
 
@@ -226,7 +277,11 @@ def main():
         print(f'Patches: eboot.bin is not the build {xml.name} was checked against: none applied')
         return
     names=selected_patches(xml,needed,a.extra,os.environ.get('GOW3_PATCHES_ONLY')=='1')
-    segments=eboot_segments((a.out/'eboot.elf').read_bytes())
+    elf=(a.out/'eboot.elf').read_bytes()
+    segments=eboot_segments(elf)
+    for name in original_mismatches(xml,names,needed,elf):
+        print(f'Patches: {name}: the eboot has other bytes at its addresses: not applied')
+        names.remove(name)
     writes=compile_patches(xml,names,needed,segments)
     if a.patches_dir:
         # After the built-in ones: an external patch of the same bytes wins.

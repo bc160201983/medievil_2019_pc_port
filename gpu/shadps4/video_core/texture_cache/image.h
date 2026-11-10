@@ -35,9 +35,13 @@ enum ImageFlagBits : u32 {
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
     Aliased = 1 << 8,     ///< gow3: another image has the same guest address (alias_states)
+    Undefined = 1 << 9,   ///< gow3: made where a guest unmap freed an image; contents undefined
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
+/// gow3: waits until the images queued for release on the release thread are destroyed (before
+/// the allocator goes; image.cpp).
+void DrainImageReleases();
 // gow3: " (live)", " (DESTROYED)" or " (null)" from recent image lifetimes ("" when unknown).
 const char* DescribeImageHandle(VkImage image);
 

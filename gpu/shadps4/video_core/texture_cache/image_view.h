@@ -54,6 +54,7 @@ struct ImageView {
 
     ImageViewInfo info;
     vk::UniqueImageView image_view;
+    vk::ImageAspectFlags view_aspect{}; ///< gow3: the aspect the view was created with
 };
 
 } // namespace VideoCore

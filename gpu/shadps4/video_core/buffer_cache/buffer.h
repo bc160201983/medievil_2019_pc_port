@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <optional>
 #include <span>
@@ -155,6 +156,9 @@ struct StreamBuffer : public Buffer {
         Commit();
         return offset;
     }
+
+    /// gow3: counter the bytes of each reservation are added to (diagnostics; null: none).
+    std::atomic<u64>* written_stat = nullptr;
 
 private:
     struct Watch {

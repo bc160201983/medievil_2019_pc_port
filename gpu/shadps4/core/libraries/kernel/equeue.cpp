@@ -15,6 +15,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "gow3_fence_stats.h"
 
 namespace Libraries::Kernel {
 
@@ -211,6 +212,9 @@ bool EqueueInternal::TriggerEvent(u64 ident, s16 filter, void* trigger_data) {
         std::scoped_lock lock{m_mutex};
         for (auto& event : m_events) {
             if (event.event.ident == ident && event.event.filter == filter) {
+                if (Gow3Stats::enabled) {
+                    event.triggered_ns = Gow3FenceStats::NowNs();
+                }
                 if (filter == OrbisKernelEvent::Filter::VideoOut) {
                     event.TriggerDisplay(trigger_data);
                 } else if (filter == OrbisKernelEvent::Filter::User) {
@@ -233,6 +237,9 @@ int EqueueInternal::GetTriggeredEvents(OrbisKernelEvent* ev, int num) {
     int count = 0;
     for (auto it = m_events.begin(); it != m_events.end();) {
         if (it->IsTriggered()) {
+            if (count == 0) {
+                Gow3FenceStats::last_trigger_ns = it->triggered_ns;
+            }
             ev[count++] = it->event;
             if (it->event.flags & OrbisKernelEvent::Flags::Clear) {
                 it->Clear();
@@ -458,6 +465,12 @@ int PS4_SYSV_ABI sceKernelDeleteEqueue(OrbisKernelEqueue eq) {
     return ORBIS_OK;
 }
 
+// gow3: GOW3_WAIT_SITES (src/runtime_waitsites.c): how long the guest's event queue waits take, per
+// call site; UE4 waits for GPU events (end of pipe, flips) here.
+extern "C" int runtime_wait_sites_enabled(void);
+extern "C" u64 runtime_wait_now(void);
+extern "C" void runtime_wait_site(void* return_address, unsigned kind, u64 requested_ns, u64 actual_ns);
+
 int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev, int num, int* out,
                                      OrbisKernelUseconds* timo) {
     HLE_TRACE;
@@ -479,7 +492,20 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
+    const u64 requested_ns = timo ? u64(*timo) * 1000 : 0;
+    const u64 wait_start = runtime_wait_sites_enabled() ? runtime_wait_now() : 0;
+    const u64 stats_start = Gow3Stats::enabled ? Gow3FenceStats::NowNs() : 0;
+    Gow3FenceStats::last_trigger_ns = 0;
     *out = equeue->WaitForEvents(ev, num, timo);
+    if (wait_start) {
+        runtime_wait_site(__builtin_return_address(0), 10, requested_ns, runtime_wait_now() - wait_start);
+    }
+    if (stats_start) {
+        // gow3 gate 2 (study-fence-waits.md 5.2): which event each thread waits for, how long.
+        const bool timeout = *out == 0;
+        Gow3FenceStats::NoteEqueueWait(timeout ? s16(0) : ev[0].filter, timeout ? 0 : ev[0].ident,
+                                       Gow3FenceStats::NowNs() - stats_start, timeout);
+    }
 
     if (*out == 0) {
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;

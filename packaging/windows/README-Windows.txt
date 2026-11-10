@@ -35,6 +35,14 @@ Render resolution
 - 60 FPS is the default and the recommended setting. Engine frame rate 120 or 240 (Performance
   page) is experimental: it can stutter and needs a fast CPU.
 
+NVIDIA DLSS (RTX graphics cards)
+- DLSS replaces the game's anti-aliasing: DLAA at Render scale 100, DLSS upscaling below it
+  (Quality / Balanced / Performance follow the render scale). Turn it on in the launcher
+  (Graphics > NVIDIA DLSS), in the game's menu (Image tab) or with F9 while playing.
+- NVIDIA's DLSS library is not included: copy nvngx_dlss.dll (from NVIDIA's DLSS SDK,
+  github.com/NVIDIA/DLSS, lib\Windows_x86_64\rel, or from another game) into the bin folder next to
+  medievil-runtime.exe. gow3_dlss.dll, the port's bridge to it, is already there.
+
 Next time
 - "Play MediEvil.exe" starts the game straight away with the saved settings (shortcut, Steam).
 - Saves, shader cache and the log: user\ next to MediEvil.exe (keep it when updating).

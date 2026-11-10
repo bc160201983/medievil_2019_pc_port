@@ -2,12 +2,14 @@
 
 UE4 games read their config only from their paks. A small pak whose name ends in _P mounts with
 priority over them, so a changed copy of Engine/Config/PS4/PS4Engine.ini (taken from the game's
-own pak) wins. r.ScreenPercentage scales the 3D scene: 200% of the 1080p frame renders it at
-3840x2160 (4K) and scales it down to the game's 1920x1080 output (supersampling: much sharper
-edges and detail). The HUD stays at 1080p. The game itself keeps its 60 FPS cap.
-The pak is written into the game's Paks folder at every start and removed for native.
+own pak) wins. r.ScreenPercentage scales the 3D scene of the game's output (medievil.ini
+render_scale): 200% of a 1080p output renders it at 3840x2160 and scales it down (supersampling:
+much sharper edges and detail); below 100% UE4's temporal upsampling rebuilds the output from the
+game's own motion vectors. The HUD stays at the output size. The output size itself is booted by
+run.py (output_resolution). The pak is written into the game's Paks folder at every start and
+removed when it changes nothing.
 
-Usage: python scripts/ue4_override.py <game dir> [--resolution native|480p|720p|1440p|1800p|4K]
+Usage: python scripts/ue4_override.py <game dir> [--output 2560x1440] [--scale 67]
 """
 import argparse
 import hashlib
@@ -23,17 +25,8 @@ PAK_MAGIC = 0x5A6F12E1
 PAK_NAME = 'pakchunk99-ps4_p.pak'
 OLD_PAK_NAME = 'pakchunk99-ps4_P.pak'
 CONFIG = 'Engine/Config/PS4/PS4Engine.ini'
-# Render resolution (medievil.ini render_resolution) -> scene scale of the 1080p frame, in percent.
-SCREEN_PERCENTAGE = {'native': None, '480p': '44.444', '720p': '66.667', '1440p': '133.333',
-                     '1800p': '166.667', '4K': '200'}
-# Native output: the game's own output size (PS4Engine.ini r.setres, 1920x1080 as shipped), shown
-# pixel for pixel on a 1440p or 4K display. 4K needs the "Native 4K framebuffer pool" patch.
-# Upscaling at native output (medievil.ini ue4_upscale): UE4's temporal upsampling renders the 3D
-# scene at a lower scale and its temporal AA rebuilds the full output from the game's own motion
-# vectors (as FSR 2 / DLSS do, without the AI). Not with the supersampling scales above.
-TEMPORAL_UPSCALE = {'quality': '66.667', 'balanced': '58', 'performance': '50'}
-NATIVE_OUTPUT = {'720p_native': '1280x720', '1440p_native': '2560x1440', '1800p_native': '3200x1800',
-                 '4K_native': '3840x2160'}
+# Render scales below 100% use UE4's temporal upsampling: its temporal AA rebuilds the full
+# output from the game's own motion vectors (as FSR 2 / DLSS do, without the AI).
 
 
 # r.SetRes (native output, runtime_extra.c): UE4's FSystemResolution::RequestResolutionChange loads
@@ -208,27 +201,24 @@ QUALITY = {
                   'r.SceneColorFringeQuality': '0', 'r.BloomQuality': '2', 'r.RefractionQuality': '0'},
     # Above the PS4: GPU cost, little memory (the game keeps its PS4 memory budget, so texture
     # streaming pools stay as shipped).
+    # Local light shadow sizes and the sun's distance / cascades: LOCAL_SHADOWS and SUN_SHADOWS.
     'high': {
-        'r.ShadowQuality': '4', 'r.Shadow.MaxCSMResolution': '2048', 'r.Shadow.MaxResolution': '2048',
-        'r.Shadow.DistanceScale': '1.5', 'r.AmbientOcclusionLevels': '3', 'r.SSR.Quality': '3',
+        'r.ShadowQuality': '4', 'r.Shadow.MaxCSMResolution': '2048', 'r.AmbientOcclusionLevels': '3',
+        'r.SSR.Quality': '3',
         'r.MaxAnisotropy': '16', 'r.ViewDistanceScale': '1.5', 'r.StaticMeshLODDistanceScale': '0.75',
         'foliage.LODDistanceScale': '1.5',
     },
     'ultra': {
-        'r.ShadowQuality': '5', 'r.Shadow.MaxCSMResolution': '4096', 'r.Shadow.MaxResolution': '2048',
-        'r.Shadow.DistanceScale': '2', 'r.Shadow.CSM.MaxCascades': '4', 'r.AmbientOcclusionLevels': '3',
+        'r.ShadowQuality': '5', 'r.Shadow.MaxCSMResolution': '4096', 'r.AmbientOcclusionLevels': '3',
         'r.SSR.Quality': '4', 'r.MaxAnisotropy': '16', 'r.ViewDistanceScale': '2',
-        'r.StaticMeshLODDistanceScale': '0.5', 'foliage.LODDistanceScale': '2',
-        'r.DetailMode': '2', 'r.MaterialQualityLevel': '1',
+        'r.StaticMeshLODDistanceScale': '0.5', 'foliage.LODDistanceScale': '2', 'r.DetailMode': '2',
     },
     'medium': {
-        'r.ShadowQuality': '2', 'r.Shadow.MaxCSMResolution': '1536', 'r.Shadow.MaxResolution': '1024',
-        'r.AmbientOcclusionLevels': '1', 'r.SSR.Quality': '1', 'r.MotionBlurQuality': '2',
+        'r.ShadowQuality': '2', 'r.Shadow.MaxCSMResolution': '1536', 'r.AmbientOcclusionLevels': '1', 'r.SSR.Quality': '1', 'r.MotionBlurQuality': '2',
         'r.DepthOfFieldQuality': '1', 'r.ViewDistanceScale': '0.85',
     },
     'low': {
-        'r.ShadowQuality': '1', 'r.Shadow.MaxCSMResolution': '1024', 'r.Shadow.MaxResolution': '512',
-        'r.Shadow.CSM.MaxCascades': '2', 'r.VolumetricFog': '0', 'r.AmbientOcclusionLevels': '0',
+        'r.ShadowQuality': '1', 'r.Shadow.MaxCSMResolution': '1024', 'r.VolumetricFog': '0', 'r.AmbientOcclusionLevels': '0',
         'r.SSR.Quality': '0', 'r.MotionBlurQuality': '0', 'r.DepthOfFieldQuality': '0',
         'r.LensFlareQuality': '0', 'r.SceneColorFringeQuality': '0', 'r.BloomQuality': '2',
         'r.RefractionQuality': '0', 'r.ViewDistanceScale': '0.7', 'foliage.DensityScale': '0.6',
@@ -240,7 +230,8 @@ QUALITY = {
 # Point and spot light shadows at one fixed size per preset, with small lights unshadowed. UE4
 # sizes them by their size on screen, so walking re-creates them constantly; those re-created
 # maps flickered on the port (shadows blinking while moving, MediEvil's outdoor levels).
-# The second number is r.Shadow.RadiusThreshold: lights smaller than that on screen cast no shadow.
+# The second number is r.Shadow.RadiusThreshold: shadow casters (objects) smaller than that on
+# screen are left out of whole-scene (point, spot, cascade) shadow maps; it does not cull lights.
 # Every shadowed point light redraws its surroundings six times, and the port's GPU thread keeps
 # 60 FPS up to about 2000 draws a frame; busy outdoor scenes reached 4000 (30 FPS) before.
 LOCAL_SHADOWS = {'ultra': (1024, 0.06), 'high': (1024, 0.08), 'console': (512, 0.1),
@@ -250,8 +241,11 @@ SUN_SHADOWS = {'ultra': ('3', '1.5'), 'high': ('3', '1.2'), 'console': ('2', '0.
                'medium': ('2', '0.75'), 'low': ('2', '0.6')}
 
 
-# The developers' debug menu (R3 in the game: level select, complete level, gear and items for
+# The developers' debug menu (R3 in a level: level select, complete level, gear and items for
 # the level, runes, gold, life bottles, invulnerability). OverbiteGameSingleton reads the switch.
+# Dan's Blueprint opens it on R3; on 01.02 only while L1 and R1 are held (its R3 event checks
+# RightShoulderDown and LeftShoulderDown, set by its own shoulder key events). The main menu has
+# no debug menu (research/patches/ue4/debug-menu-0102.md).
 GAME_CONFIG = 'OVERBITE/Config/PS4/PS4Game.ini'
 
 
@@ -306,23 +300,23 @@ def apply_edits(name, data, edits):
     return data
 
 
-# The debug menu's first resolution button follows the native output setting: the base PS4
-# renderer makes its buffers at the display size at start, so only a live r.SetRes switches.
-# Command and label keep their lengths (the game's own 18 and 22 characters).
-SUPERSAMPLING = ('1440p', '1800p', '4K')
-NATIVE_BUTTON = {'720p_native': (b'r.SetRes 1280x720 ', b'Cinematic Mode (720p) '),
-                 '1440p_native': (b'r.SetRes 2560x1440', b'Cinematic Mode (1440p)'),
-                 '1800p_native': (b'r.SetRes 3200x1800', b'Cinematic Mode (1800p)'),
-                 '4K_native': (b'r.SetRes 3840x2160', b'Cinematic Mode (2160p)')}
+# The debug menu's first resolution button follows the output resolution: the debug menu's
+# navigation needs 1080p, and this button switches back. Command and label keep their lengths
+# (the game's own 18 and 22 characters, padded with spaces).
+def native_button(output):
+    command, label = f'r.SetRes {output}'.encode(), f'Cinematic Mode ({output.split("x")[1]}p)'.encode()
+    if len(command) > 18 or len(label) > 22:
+        return None
+    return command.ljust(18), label.ljust(22)
 
 
-def debug_hud(game, resolution='native'):
+def debug_hud(game, output='1920x1080', supersampled=False):
     data = apply_edits(DEBUG_HUD, read_file(game, DEBUG_HUD), DEBUG_HUD_EDITS)
-    if resolution in NATIVE_BUTTON:
-        command, label = NATIVE_BUTTON[resolution]
+    if output != '1920x1080' and (button := native_button(output)):
+        command, label = button
         data = data.replace(b'r.SetRes 3840x2160\0', command + b'\0', 1)
         data = data.replace(b'Cinematic Mode (2160p)\0', label + b'\0')
-    elif resolution in SUPERSAMPLING:
+    elif supersampled:
         # A larger output on top of a supersampled scene runs out of the game's PS4 memory (the
         # crash of "Cinematic Mode" at 4K): both buttons keep 1080p, as the in-game menu's do.
         data = data.replace(b'r.SetRes 3840x2160\0', b'r.SetRes 1920x1080\0', 1)
@@ -382,6 +376,18 @@ def voice_language(game, voice):
     return data[:start] + bytes(script) + data[end:]
 
 
+# 01.02 (not 01.00): the game instance runs "t.MaxFPS 30" or "t.MaxFPS 60" (ExecuteConsoleCommand),
+# which capped the game at 60 FPS. Above 60 FPS both become "t.MaxFPS 00" (0: no limit; same
+# length), so the engine range and the port's limiter decide as in 01.00.
+MAX_FPS_COMMANDS = (b'\x1ft.MaxFPS 30\x00', b'\x1ft.MaxFPS 60\x00')
+
+
+def without_max_fps(data):
+    for command in MAX_FPS_COMMANDS:
+        data = data.replace(command, command[:-3] + b'00\x00')
+    return data
+
+
 def edited_asset(game, name, edits):
     return apply_edits(name, read_file(game, name), edits)
 
@@ -392,12 +398,8 @@ def edited_asset(game, name, edits):
 ANTI_ALIASING = {'taa': None, 'fxaa': '2', 'off': '0'}
 
 
-def apply(game, resolution='native', quality='console', fps=60, debug_menu=False, infinite_ammo=False,
-          upscale='off', aa='taa', voice=''):
-    """Writes or removes the override pak. Returns a short description of the active state."""
-    pak = paks_dir(game) / PAK_NAME
-    # Earlier builds wrote the `_P` spelling: on Linux it stayed behind, unread.
-    (paks_dir(game) / OLD_PAK_NAME).unlink(missing_ok=True)
+def preset_values(quality):
+    """The console variables a quality preset writes into the override pak."""
     values = dict(QUALITY.get(quality, {}))
     if quality in LOCAL_SHADOWS:
         size, threshold = LOCAL_SHADOWS[quality]
@@ -405,22 +407,130 @@ def apply(game, resolution='native', quality='console', fps=60, debug_menu=False
                        'r.Shadow.RadiusThreshold': str(threshold), 'r.Shadow.CacheWholeSceneShadows': '1'})
         cascades, distance = SUN_SHADOWS[quality]
         values.update({'r.Shadow.CSM.MaxCascades': cascades, 'r.Shadow.DistanceScale': distance})
-    percentage = SCREEN_PERCENTAGE.get(resolution)
-    if percentage:
-        values['r.ScreenPercentage'] = percentage
-    output = NATIVE_OUTPUT.get(resolution)
-    # Native output is not set here: the runtime requests it live (GOW3_UE4_SETRES). Writing the
-    # same value into the ini first made that request a no-op.
-    scale = TEMPORAL_UPSCALE.get(upscale) if not percentage else None
-    if scale:
-        values.update({'r.ScreenPercentage': scale, 'r.TemporalAA.Upsampling': '1'})
-    aa_quality = None if scale else ANTI_ALIASING.get(aa)
+    return values
+
+
+# The cvars of the in-game menu's live graphics options (gpu/shim/gow3_settings.h UE4LiveOptions),
+# and the engine's own defaults of those neither PS4Engine.ini nor BaseScalability.ini sets.
+LIVE_CVARS = ('r.Shadow.MinResolution', 'r.Shadow.MaxResolution', 'r.Shadow.DistanceScale',
+              'r.Shadow.CSM.MaxCascades', 'r.ShadowQuality', 'r.ViewDistanceScale',
+              'r.StaticMeshLODDistanceScale', 'foliage.LODDistanceScale', 'r.AmbientOcclusionLevels',
+              'r.SSR.Quality', 'r.VolumetricFog', 'r.MotionBlurQuality', 'r.DepthOfFieldQuality',
+              'r.BloomQuality', 'r.LensFlareQuality', 'r.SceneColorFringeQuality')
+LIVE_ENGINE_DEFAULTS = {'r.Shadow.MinResolution': '32', 'r.StaticMeshLODDistanceScale': '1',
+                        'foliage.LODDistanceScale': '1'}
+
+
+def ini_sections(text):
+    """{section: {lowercase key: value}} of an UE4 ini (the last value of a key wins)."""
+    sections, current = {}, None
+    for line in text.replace('\r', '').split('\n'):
+        line = line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            current = sections.setdefault(line[1:-1], {})
+        elif current is not None and '=' in line and not line.startswith(';'):
+            key, value = line.split('=', 1)
+            current[key.strip().lstrip('+').lower()] = value.strip()
+    return sections
+
+
+def preset_cvars(game, quality):
+    """What the live options' cvars are under `quality` at start: the pak's preset value, else the
+    game's PS4Engine.ini [SystemSettings], else its BaseScalability.ini at level 3 (the PS4 starts
+    every scalability group at 3), else the engine default. For the menu's "Preset" choice."""
+    values = preset_values(quality)
+    for item in os.environ.get('GOW3_UE4_CVARS', '').split(';'):
+        name, sep, value = item.partition('=')
+        if sep and name.strip():
+            values[name.strip()] = value.strip()
+    system = ini_sections(read_file(game, CONFIG).decode('utf-8-sig', 'replace')).get('SystemSettings', {})
+    scalability = {}
+    for section, entries in ini_sections(read_file(game, 'Engine/Config/BaseScalability.ini')
+                                         .decode('utf-8-sig', 'replace')).items():
+        if section.endswith('@3'):
+            scalability.update(entries)
+    result = {}
+    for name in LIVE_CVARS:
+        lower = {k.lower(): v for k, v in values.items()}
+        value = lower.get(name.lower()) or system.get(name.lower()) or scalability.get(name.lower()) or \
+            LIVE_ENGINE_DEFAULTS.get(name)
+        if value:
+            result[name] = value
+    return result
+
+
+def apply(game, output='1920x1080', scale=100, quality='console', fps=60, debug_menu=False,
+          infinite_ammo=False, hzb=False, effects='75', aa='taa', voice='', graphics=None):
+    """Writes or removes the override pak. Returns a short description of the active state.
+    `graphics`: the graphics settings' console variables (graphics_options.graphics_cvars, run.py), which
+    replace the quality preset's; a diagnostic preset (diag_*) still adds its own on top."""
+    pak = paks_dir(game) / PAK_NAME
+    # Earlier builds wrote the `_P` spelling: on Linux it stayed behind, unread.
+    (paks_dir(game) / OLD_PAK_NAME).unlink(missing_ok=True)
+    if graphics is not None:
+        values = dict(graphics)
+        if quality.startswith('diag_'):
+            values.update(QUALITY.get(quality, {}))
+    else:
+        values = preset_values(quality)
+    if scale != 100:
+        values['r.ScreenPercentage'] = str(scale)
+    if scale < 100:
+        values['r.TemporalAA.Upsampling'] = '1'
+    if output != '1920x1080':
+        values['r.setres'] = output
+    # Effects resolution (medievil.ini effects_resolution): UE4's separate translucency, where the
+    # enemy death effects, smoke and fire draw, at 75 or 50% of the render size, blended in by
+    # depth. At 4K several deaths at once cost 2-3 ms of GPU a frame at full size; at 50% none
+    # showed (N-19, N-20). 50% at 4K is the PS4's 1080p effect detail. Default 75: the user saw
+    # 50% only as slightly less sharp on a 32" 4K OLED up close (N-26).
+    if effects in ('75', '50'):
+        values['r.SeparateTranslucencyScreenPercentage'] = effects
+    # Anti-aliasing (medievil.ini ue4_aa): temporal (the game's), FXAA or off; below 100% render
+    # scale the temporal upsampler needs TAA.
+    aa_quality = None if scale < 100 else ANTI_ALIASING.get(aa)
     if aa_quality is not None:
         values['r.PostProcessAAQuality'] = aa_quality
+    # No memory cvars: this build has no r.GarlicHeapSizeMB, and the PS4 device profile's
+    # r.Streaming.PoolSize=2000 outranks [SystemSettings]. Above 1080p the game's graphics memory
+    # grows with GOW3_DMEM_MB (graphics_options.py), as it pools all of its direct memory
+    # (research/docs/fix-inventory.md, Caveats).
+    # The port answers the game's occlusion queries "visible" (shadPS4's synthetic counters), so
+    # they cull nothing and their bounding-box draws cost ~150 draws a frame in busy views
+    # (+~5% FPS without them, research: T-O1). hzb (the runtime's HZB remap, GOW3_HZB_REMAP=1,
+    # analysed eboot only): UE4's HZB occlusion culls, served from finished copies without a GPU
+    # wait (T-HZ4); the few queries it still issues are read 3 frames late, so the game never
+    # waits for them (T-HZ4e).
+    if hzb:
+        values.update({'r.AllowOcclusionQueries': '1', 'r.HZBOcclusion': '1',
+                       'r.NumBufferedOcclusionQueries': '3'})
+    else:
+        values['r.AllowOcclusionQueries'] = '0'
+    # DBuffer decals force a full depth prepass in UE4 4.21 (the G-buffer drawn twice: ~630-740
+    # draws a frame in heavy views, ~28%), whatever r.EarlyZPass says; the decals they serve were
+    # invisible in the heavy view (1-4/255 on Dan's boots). Off, and the PS4's own partial prepass
+    # (large occluders, r.EarlyZPass=1) keeps early depth for the GPU: heavy views ~600 fewer
+    # draws, the best 1% lows so far (research: study-heavy-frame-map.md, T-Z2-T-Z5, 2026-10-21).
+    # GOW3_DECAL_PREPASS=1: the PS4's settings (DBuffer decals, their full prepass).
+    if os.environ.get('GOW3_DECAL_PREPASS') != '1':
+        values.update({'r.DBuffer': '0', 'r.EarlyZPass': '1'})
+    # GPU particles: one simulation pass a frame with the real frame time; the default fixed step
+    # (1/30 s) added a second pass that, above 30 FPS, only copied the particles back (~190 draws,
+    # study-heavy-frame-map.md, T-H3b). GOW3_PARTICLE_FIXED_STEP=1: the fixed step.
+    if os.environ.get('GOW3_PARTICLE_FIXED_STEP') != '1':
+        values['r.GPUParticle.FixDeltaSeconds'] = '0'
+    # Extra console variables for experiments, "name=value;name=value" (GOW3_UE4_CVARS); they win
+    # over the presets above.
+    extra = {}
+    for item in os.environ.get('GOW3_UE4_CVARS', '').split(';'):
+        name, sep, value = item.partition('=')
+        if sep and name.strip():
+            extra[name.strip()] = value.strip()
+    values.update(extra)
     engine = frame_rate_range(fps) if fps > 60 else {}
     if not values and not engine and not debug_menu and not infinite_ammo and not voice:
         pak.unlink(missing_ok=True)
-        return 'native 1080p, console quality, 60 FPS'
+        return '1920x1080 output, render scale 100%, console quality, 60 FPS'
     files = {CONFIG: set_values(read_file(game, CONFIG), values, engine)}
     # Native output: the base PS4 renderer makes its buffers at the display size at start and only
     # a live r.SetRes changes them; the runtime sets it (GOW3_UE4_SETRES), and the debug menu's
@@ -428,8 +538,8 @@ def apply(game, resolution='native', quality='console', fps=60, debug_menu=False
     # A game build whose assets differ (another version) loses only that cheat, not the rest.
     if debug_menu:
         try:
-            files[DEBUG_HUD] = debug_hud(game, resolution)
             files[GAME_CONFIG] = debug_menu_config(game, True)
+            files[DEBUG_HUD] = debug_hud(game, output, scale > 100)
         except (ValueError, FileNotFoundError) as error:
             print(f'Debug menu: not available for this game build ({error})', flush=True)
             debug_menu = False
@@ -445,22 +555,27 @@ def apply(game, resolution='native', quality='console', fps=60, debug_menu=False
         except (ValueError, FileNotFoundError) as error:
             print(f'Voice language: not available for this game build ({error})', flush=True)
             voice = ''
+    if fps > 60:
+        instance = files.get(GAME_INSTANCE) or read_file(game, GAME_INSTANCE)
+        if any(command in instance for command in MAX_FPS_COMMANDS):
+            files[GAME_INSTANCE] = without_max_fps(instance)
     write_pak(pak, files)
-    return (f'{resolution if percentage or output else "native 1080p"}'
-            f'{f" (r.ScreenPercentage={percentage})" if percentage else ""}'
-            f'{f" (native output {output})" if output else ""}'
-            f'{f", temporal upscaling {upscale} ({scale}%)" if scale else ""}'
-            f'{f", anti-aliasing {aa}" if aa_quality is not None else ""}, {quality} quality, '
-            f'{f"up to {fps}" if fps > 60 else 60} FPS{", debug menu (R3)" if debug_menu else ""}'
-            f'{", unlimited ammo" if infinite_ammo else ""}{f", voices {voice}" if voice else ""}')
+    return (f'{output} output, render scale {scale}%'
+            f'{" (temporal upsampling)" if scale < 100 else " (supersampled)" if scale > 100 else ""}, {quality} quality, '
+            f'{f"up to {fps}" if fps > 60 else 60} FPS{", debug menu (R3; 01.02: L1 + R1 + R3)" if debug_menu else ""}'
+            f'{f", anti-aliasing {aa}" if aa_quality is not None else ""}'
+            f'{", unlimited ammo" if infinite_ammo else ""}{f", voices {voice}" if voice else ""}'
+            f'{"; extra cvars " + ", ".join(f"{k}={v}" for k, v in extra.items()) if extra else ""}')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('game', type=Path)
-    parser.add_argument('--resolution', choices=[*SCREEN_PERCENTAGE, *NATIVE_OUTPUT], default='native')
+    parser.add_argument('--output', default='1920x1080', help="the game's output size, WxH")
+    parser.add_argument('--scale', type=int, default=100, help='render scale in percent (25-200)')
     parser.add_argument('--quality', choices=list(QUALITY), default='console')
     parser.add_argument('--fps', type=int, default=60, help='engine frame rate (60 = original)')
-    parser.add_argument('--debug-menu', action='store_true', help='allow the developer debug menu (R3)')
+    parser.add_argument('--debug-menu', action='store_true', help='allow the developer debug menu (R3 in a level; 01.02: hold L1 + R1, then R3)')
     args = parser.parse_args()
-    print('Render resolution:', apply(args.game, args.resolution, args.quality, args.fps, args.debug_menu))
+    print('Render resolution:', apply(args.game, args.output, args.scale, args.quality, args.fps,
+                                      args.debug_menu))

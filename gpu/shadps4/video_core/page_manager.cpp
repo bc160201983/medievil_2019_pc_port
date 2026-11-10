@@ -75,6 +75,7 @@ struct PageManager::Impl {
         }
         if (Common::IsWriteError(context)) {
             Gow3Stats::Timer timer{Gow3Stats::t_write_faults};
+            Gow3Stats::fault_rip = Common::GetRip(context);
             return rasterizer->OnWriteFault(addr, is_gpu_thread);
         } else {
             Gow3Stats::read_faults.fetch_add(1, std::memory_order_relaxed);

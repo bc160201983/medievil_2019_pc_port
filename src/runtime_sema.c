@@ -104,7 +104,13 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
     pthread_mutex_unlock(&lock);
     return result;
 }
-static ABI int32_t sem_wait(uint32_t id,int32_t need,uint32_t *timeout) { return wait_count(id,need,timeout,1); }
+static ABI int32_t sem_wait(uint32_t id,int32_t need,uint32_t *timeout) {
+    const uint64_t requested=timeout ? (uint64_t)*timeout*1000 : 0;
+    RUNTIME_WAIT_BEGIN();
+    const int32_t r=wait_count(id,need,timeout,1);
+    RUNTIME_WAIT_END(7, requested);
+    return r;
+}
 static ABI int32_t sem_poll(uint32_t id,int32_t need) { return wait_count(id,need,NULL,0); }
 static ABI int32_t sem_signal(uint32_t id,int32_t count) {
     pthread_mutex_lock(&lock);

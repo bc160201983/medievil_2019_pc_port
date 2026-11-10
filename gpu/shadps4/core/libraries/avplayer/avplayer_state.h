@@ -33,6 +33,7 @@ public:
     bool Stop();
     bool Pause();
     bool Resume();
+    bool Suspend();
     void SetAvSyncMode(AvPlayerAvSyncMode sync_mode);
     bool GetAudioData(AvPlayerFrameInfo& audio_info);
     bool GetVideoData(AvPlayerFrameInfo& video_info);

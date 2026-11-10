@@ -592,6 +592,13 @@ void PipelineCache::PublishShaders(bool wait) {
 }
 
 void PipelineCache::PublishGraphics(bool wait) {
+    // gow3 (impl-stage-a-decode.md): called for every draw on stage A. tsl::robin_map's begin()
+    // walks the buckets to the first full one, and the map keeps the buckets it grew to while
+    // compilations were queued (up to 64: 128-256 buckets, each a key of a few hundred bytes):
+    // an empty map was a walk over all of them per draw. Empty: nothing to publish, as before.
+    if (pending_graphics.empty()) {
+        return;
+    }
     for (auto it = pending_graphics.begin(); it != pending_graphics.end();) {
         auto build = it.value();
         if (wait) {

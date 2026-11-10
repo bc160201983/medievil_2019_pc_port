@@ -2,6 +2,7 @@
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <chrono>
@@ -217,8 +218,64 @@ void FrameCapture::AddDisplayBuffer(VAddr address) {
     }
 }
 
+namespace {
+struct TargetWatchSpec {
+    u32 width = 0, height = 0, remaining = 0;
+    char format[64] = {}; ///< optional ":Format" (vk::to_string, e.g. R16G16B16A16Sfloat)
+};
+TargetWatchSpec& WatchSpec() {
+    static TargetWatchSpec spec = [] {
+        TargetWatchSpec s;
+        const char* env = std::getenv("GOW3_CAPTURE_ON_TARGET");
+        if (env && std::sscanf(env, "%ux%u:%63s", &s.width, &s.height, s.format) >= 2) {
+            const char* count = std::getenv("GOW3_CAPTURE_ON_TARGET_COUNT");
+            s.remaining = count && *count ? u32(std::strtoul(count, nullptr, 10)) : 2;
+        }
+        return s;
+    }();
+    return spec;
+}
+} // namespace
+
+bool FrameCapture::TargetWatch() {
+    return WatchSpec().remaining != 0;
+}
+
+void FrameCapture::StartForTarget(const VideoCore::ImageInfo* const* colors, u32 num_colors) {
+    auto& spec = WatchSpec();
+    if (!spec.remaining || state.load(std::memory_order_relaxed) != Idle) {
+        return;
+    }
+    for (u32 i = 0; i < num_colors; ++i) {
+        if (colors[i] && colors[i]->size.width == spec.width &&
+            colors[i]->size.height == spec.height &&
+            (!spec.format[0] || vk::to_string(colors[i]->pixel_format) == spec.format)) {
+            --spec.remaining;
+            entries.clear();
+            pending_sampled.clear();
+            pending_buffers.clear();
+            pass_open = false;
+            state.store(Recording, std::memory_order_release);
+            target_recording = true;
+            std::printf("Frame capture: started at a %ux%u target (%#llx)\n", spec.width,
+                        spec.height, static_cast<unsigned long long>(colors[i]->guest_address));
+            return;
+        }
+    }
+}
+
 void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_colors,
                              const VideoCore::ImageInfo* depth) {
+    // gow3: a recording started by StartForTarget may see no frame boundary while a level loads.
+    if (state.load(std::memory_order_relaxed) == Recording && entries.size() >= 400) {
+        Write(last_presented.load(std::memory_order_relaxed));
+        entries.clear();
+        pending_sampled.clear();
+        pending_buffers.clear();
+        state.store(Idle, std::memory_order_release);
+        target_recording = false;
+        return;
+    }
     std::vector<Target> targets;
     bool display = false;
     {
@@ -234,13 +291,20 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
     display = display && targets.size() == 1;
     const bool new_pass = !(pass_open && !entries.empty() && !entries.back().compute &&
                             entries.back().colors == targets);
-    if (display && new_pass) {
+    // gow3: MediEvil writes a display buffer alone twice a frame (the composite, then the UI): a
+    // capture that ended at the second one held only UI passes. It ends at a display pass that
+    // follows a scene pass (one with a depth target).
+    const bool saw_scene = std::ranges::any_of(
+        entries, [](const Entry& e) { return !e.compute && e.depth.address != 0; });
+    if (display && new_pass &&
+        (state.load(std::memory_order_relaxed) != Recording || saw_scene)) {
         if (state.load(std::memory_order_relaxed) == Recording) {
             Write(last_presented.load(std::memory_order_relaxed));
             entries.clear();
             pending_sampled.clear();
             pending_buffers.clear();
             state.store(Idle, std::memory_order_release);
+            target_recording = false;
             return;
         }
         entries.clear();
@@ -248,6 +312,7 @@ void FrameCapture::BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_
         pending_buffers.clear();
         pass_open = false;
         state.store(Recording, std::memory_order_release);
+        target_recording = false;
     }
     if (state.load(std::memory_order_relaxed) != Recording) {
         pending_sampled.clear();
@@ -296,7 +361,13 @@ void FrameCapture::Dispatch(u64 cs_hash, u32 x, u32 y, u32 z) {
 }
 
 void FrameCapture::Buffer(u64 stage_hash, u32 slot, VAddr address, const void* data, u64 size) {
-    const u64 bytes = std::min<u64>(size, 1024) & ~u64(3);
+    // GOW3_CAPTURE_BUFFER_BYTES: how much of each buffer to print (default 1024; the view's
+    // constants are ~3.3 KB).
+    static const u64 limit = [] {
+        const char* env = std::getenv("GOW3_CAPTURE_BUFFER_BYTES");
+        return env && *env ? std::strtoull(env, nullptr, 10) : u64{1024};
+    }();
+    const u64 bytes = std::min<u64>(size, limit) & ~u64(3);
     std::string out = std::format("  buffer stage {:016x} slot {} at {:#x} size {}:", stage_hash,
                                   slot, address, size);
     const auto* words = static_cast<const float*>(data);

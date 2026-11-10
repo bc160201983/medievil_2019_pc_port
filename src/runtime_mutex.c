@@ -80,11 +80,18 @@ static int32_t ensure_mutex(GuestMutex **mutex) {
     pthread_mutex_unlock(&static_init);
     return e;
 }
-static ABI int32_t mutex_lock(GuestMutex **mutex) {
+static int32_t mutex_lock_impl(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     e = orbis_error(pthread_mutex_lock(&(*mutex)->native));
     if (!e) ++locks;
+    return e;
+}
+/* GOW3_WAIT_SITES: each export the guest calls measures, so its return address is the call site. */
+static ABI int32_t mutex_lock(GuestMutex **mutex) {
+    RUNTIME_WAIT_BEGIN();
+    const int32_t e = mutex_lock_impl(mutex);
+    RUNTIME_WAIT_END(9, 0);
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
@@ -231,13 +238,19 @@ static int futex_cond_enabled(void) { return 0; }
 static int futex_cond_wait(GuestCond *c, GuestMutex *m, const struct timespec *end) { (void)c; (void)m; (void)end; return EINVAL; }
 static void futex_cond_wake(GuestCond *c, int all) { (void)c; (void)all; }
 #endif
-static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
+static int32_t cond_wait_impl(GuestCond **cond, GuestMutex **mutex) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
     return orbis_error(futex_cond_enabled() ? futex_cond_wait(*cond, *mutex, NULL)
                                             : pthread_cond_wait(&(*cond)->native, &(*mutex)->native));
+}
+static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
+    RUNTIME_WAIT_BEGIN();
+    const int32_t e = cond_wait_impl(cond, mutex);
+    RUNTIME_WAIT_END(5, 0);
+    return e;
 }
 static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end) {
     int32_t e = ensure_cond(cond);
@@ -250,7 +263,10 @@ static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struc
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
-    return cond_wait_until(cond, mutex, &end);
+    RUNTIME_WAIT_BEGIN();
+    const int32_t e = cond_wait_until(cond, mutex, &end);
+    RUNTIME_WAIT_END(6, (uint64_t)usec * 1000);
+    return e;
 }
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
@@ -268,10 +284,18 @@ static ABI int32_t cond_broadcast(GuestCond **cond) {
 }
 /* PS4 struct timespec is {int64 sec, int64 nsec}, identical to Linux x86-64. */
 typedef struct { int64_t sec, nsec; } GuestTimespec;
-static ABI int32_t cond_abs_timedwait(GuestCond **cond, GuestMutex **mutex, const GuestTimespec *abs) {
+static int32_t cond_abs_timedwait_impl(GuestCond **cond, GuestMutex **mutex, const GuestTimespec *abs) {
     if (!abs || abs->nsec < 0 || abs->nsec >= 1000000000) return orbis_error(EINVAL);
     struct timespec end = {.tv_sec = (time_t)abs->sec, .tv_nsec = (long)abs->nsec};
     return cond_wait_until(cond, mutex, &end);
+}
+/* The time left until an absolute deadline (the clock pthread_cond_timedwait uses), for the report. */
+static uint64_t until_deadline_ns(const GuestTimespec *abs) {
+    if (!abs || !runtime_wait_sites_enabled()) return 0;
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    const int64_t left = (abs->sec - (int64_t)now.tv_sec) * 1000000000 + (abs->nsec - now.tv_nsec);
+    return left > 0 ? (uint64_t)left : 0;
 }
 /* POSIX pthread APIs return positive guest errno values, unlike scePthread. */
 static int32_t posix_result(int32_t result) { return result ? (int32_t)((uint32_t)result & 0xffff) : 0; }
@@ -280,13 +304,29 @@ static ABI int32_t posix_attr_type(GuestAttr **attr,int type) { return posix_res
 static ABI int32_t posix_attr_destroy(GuestAttr **attr) { return posix_result(attr_destroy(attr)); }
 static ABI int32_t posix_mutex_init(GuestMutex **out,GuestAttr **attr) { return posix_result(mutex_init(out,attr,NULL)); }
 static ABI int32_t posix_mutex_destroy(GuestMutex **m) { return posix_result(mutex_destroy(m)); }
-static ABI int32_t posix_mutex_lock(GuestMutex **m) { return posix_result(mutex_lock(m)); }
+static ABI int32_t posix_mutex_lock(GuestMutex **m) {
+    RUNTIME_WAIT_BEGIN();
+    const int32_t e = mutex_lock_impl(m);
+    RUNTIME_WAIT_END(9, 0);
+    return posix_result(e);
+}
 static ABI int32_t posix_mutex_trylock(GuestMutex **m) { return posix_result(mutex_trylock(m)); }
 static ABI int32_t posix_mutex_unlock(GuestMutex **m) { return posix_result(mutex_unlock(m)); }
 static ABI int32_t posix_cond_init(GuestCond **c, void **a) { return posix_result(cond_init(c, a, NULL)); }
 static ABI int32_t posix_cond_destroy(GuestCond **c) { return posix_result(cond_destroy(c)); }
-static ABI int32_t posix_cond_wait(GuestCond **c, GuestMutex **m) { return posix_result(cond_wait(c, m)); }
-static ABI int32_t posix_cond_timedwait(GuestCond **c, GuestMutex **m, const GuestTimespec *t) { return posix_result(cond_abs_timedwait(c, m, t)); }
+static ABI int32_t posix_cond_wait(GuestCond **c, GuestMutex **m) {
+    RUNTIME_WAIT_BEGIN();
+    const int32_t e = cond_wait_impl(c, m);
+    RUNTIME_WAIT_END(5, 0);
+    return posix_result(e);
+}
+static ABI int32_t posix_cond_timedwait(GuestCond **c, GuestMutex **m, const GuestTimespec *t) {
+    const uint64_t requested = until_deadline_ns(t);
+    RUNTIME_WAIT_BEGIN();
+    const int32_t e = cond_abs_timedwait_impl(c, m, t);
+    RUNTIME_WAIT_END(6, requested);
+    return posix_result(e);
+}
 static ABI int32_t posix_cond_signal(GuestCond **c) { return posix_result(cond_signal(c)); }
 static ABI int32_t posix_cond_broadcast(GuestCond **c) { return posix_result(cond_broadcast(c)); }
 static ABI int32_t condattr_init(void **attr) {

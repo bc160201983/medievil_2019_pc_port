@@ -94,6 +94,14 @@ public:
         return graphics_queue;
     }
 
+    /// gow3 D3: the readback queue (a compute family without graphics); null when none.
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+    u32 GetReadbackQueueFamilyIndex() const {
+        return readback_family_index;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
     }
@@ -137,9 +145,33 @@ public:
         return vk12_features.shaderInt8;
     }
 
+    /// gow3: exact occlusion query counts (vk_occlusion.h).
+    bool IsOcclusionQueryPrecise() const {
+        return features.occlusionQueryPrecise;
+    }
+    /// gow3: query slots reset on the host (vk_occlusion.h).
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
+    }
+
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
+    }
+
+    /// gow3: VK_KHR_present_id + VK_KHR_present_wait enabled (only with GOW3_FLIP_TRACE)
+    bool IsPresentWaitEnabled() const {
+        return present_wait;
+    }
+
+    /// gow3: VK_KHR_present_id enabled (present waits or Reflex)
+    bool IsPresentIdEnabled() const {
+        return present_id;
+    }
+
+    /// gow3: VK_NV_low_latency2 enabled (GOW3_REFLEX=1)
+    bool IsLowLatency2Enabled() const {
+        return low_latency2;
     }
 
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
@@ -541,6 +573,8 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
+    u32 readback_family_index{~0u};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
@@ -569,6 +603,9 @@ private:
     bool pipeline_binaries{};
     vk::PipelineBinaryKeyKHR pipeline_binary_global_key{};
     bool maintenance_8{};
+    bool present_wait{};
+    bool present_id{};
+    bool low_latency2{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool memory_priority{};        ///< gow3: VK_EXT_memory_priority (for pageable memory)

@@ -205,7 +205,7 @@ bool Dlss::CreateFeature(vk::CommandBuffer command, const FeatureDesc& desc) {
     }
     impl->feature.reset();
     const Gow3DlssFeature feature{desc.input_width,  desc.input_height, desc.output_width,
-                                desc.output_height, desc.quality,      0,
+                                desc.output_height, desc.quality,      desc.depth_inverted ? 1 : 0,
                                 0,                  desc.hdr ? 1 : 0};
     if (!impl->api->CreateFeature(command, &feature)) {
         return false;

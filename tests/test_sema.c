@@ -4,6 +4,9 @@
 
 /* The settings menu of the GPU library restarts through probe.c, which tests do not link. */
 void runtime_restart(void) { abort(); }
+/* The guest image lives in probe.c too: no image in tests (the UE4 hooks look for none). */
+unsigned char *runtime_image_base(void) { return NULL; }
+uint64_t runtime_image_size(void) { return 0; }
 #include <assert.h>
 #include <pthread.h>
 #include <stdint.h>

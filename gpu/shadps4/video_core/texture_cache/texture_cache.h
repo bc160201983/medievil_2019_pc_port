@@ -12,6 +12,7 @@
 #include "gow3_toggles.h"
 #include <optional>
 #include <cstdlib>
+#include <source_location>
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
 #include <condition_variable>
@@ -101,6 +102,21 @@ public:
         return registry_generation.load(std::memory_order_acquire);
     }
 
+    /// gow3 region stamps (T-S1a): a sum that grows whenever an image overlapping
+    /// [address, address + size) is registered or unregistered, by 4 MiB region (a region shared
+    /// through the table's wrap only adds misses). RegistryGeneration changes for any image: one
+    /// texture streaming in invalidated every memoized texture set (~half of their misses).
+    static constexpr u32 RegionShift = 22, RegionCount = 1u << 16;
+    [[nodiscard]] u64 RegionStamp(VAddr address, u64 size) const noexcept {
+        const u64 first = address >> RegionShift;
+        const u64 last = (address + std::max<u64>(size, 1) - 1) >> RegionShift;
+        u64 stamp = 0;
+        for (u64 r = first; r <= last && r - first < RegionCount; ++r) {
+            stamp += region_gens[r & (RegionCount - 1)].load(std::memory_order_relaxed);
+        }
+        return stamp;
+    }
+
     /// gow3: FindImage's access tick for an image found by a memoized lookup. The LRU touch
     /// FindImage also does happens in UpdateImage (FindTexture), which every binding reaches.
     void MarkFound(ImageId image_id) {
@@ -122,9 +138,30 @@ public:
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
+
+    /// gow3 R1: true once after a readback copy was queued with precise readbacks: the caller
+    /// submits once the readback locks are released (Rasterizer::ProcessDownloadImages), so the
+    /// GPU makes the copy soon after the work it reads instead of at the frame's end.
+    bool TakeReadbackSubmitWanted() {
+        return readback_submit_wanted && !(readback_submit_wanted = false);
+    }
     bool ResolveReadbacks(VAddr address, u64 size, bool assume_locks = true,
                           ReadbackSource source = ReadbackSource::Unknown);
     void CancelReadbacks(VAddr address, u64 size);
+
+    /// gow3 (MediEvil HZB remap, gpu/shim/medievil_hzb.cpp): numbers the readback copies of
+    /// [address, address + size) from the first call on. Publishes the copies the GPU has
+    /// finished (no wait) and copies the first `copy_size` bytes of guest memory into `dst`.
+    /// `published` is the number of the copy those bytes come from (0: none numbered yet),
+    /// `pushed` the newest queued. ok is false without deferred readbacks or a free slot.
+    /// `restart`: numbering starts again from the next copy queued (copies queued before
+    /// carry none).
+    struct ReadbackSnapshot {
+        u64 pushed = 0, published = 0;
+        bool ok = false;
+    };
+    ReadbackSnapshot SnapshotReadback(VAddr address, u64 size, void* dst, u64 copy_size,
+                                      bool restart = false);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -165,7 +202,8 @@ public:
     }
 
     /// Updates image contents if it was modified by CPU.
-    void UpdateImage(ImageId image_id) {
+    void UpdateImage(ImageId image_id,
+                     std::source_location caller = std::source_location::current()) {
         // gow3: a clean image already tracked and touched in this GC period needs nothing.
         // Every texture binding comes here; the mutex (shared with the fault handlers of the
         // guest threads) was ~3% of the GPU thread. Flags are read atomically: an invalidation
@@ -189,9 +227,20 @@ public:
         Image& image = slot_images[image_id];
         TrackImage(image_id);
         TouchImage(image);
-        RefreshImage(image);
+        RefreshImage(image, caller);
         SynchronizeAlias(image_id);
     }
+
+    /// gow3: before a render / depth target binding: an image whose contents are undefined
+    /// (Undefined: made at an address a guest unmap freed) is not uploaded first, the GPU renders
+    /// into it. Any other first use uploads it as before (RefreshImage drops the flag).
+    void DiscardUndefinedContents(ImageId image_id);
+
+    /// gow3 (GOW3_CLEAR_SKIPS_UPLOAD): before a color target binding whose pass clears the whole
+    /// image (a fast clear pending in its CMASK, one mip and layer): its memory is not uploaded
+    /// first, the clear overwrites it. T-up2: 4K render-target-pool images uploaded 32-64 MB each
+    /// right before being cleared, the large single-frame uploads while playing.
+    void DiscardClearedContents(ImageId image_id);
 
     /// gow3: a GPU write to the image (render target, storage): images sharing its memory
     /// copy from it before their next read. From cuesta4/shadPS4 (eltutz), which fixed God of
@@ -212,13 +261,21 @@ public:
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
     /// Reuploads image contents.
-    void RefreshImage(Image& image);
+    /// `caller` names the first use in the GOW3_TEXCACHE_STATS refresh list.
+    void RefreshImage(Image& image,
+                      std::source_location caller = std::source_location::current());
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     /// extra_lod_bias: gow3, added to the S#'s bias (reduced scene rendering).
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth, float extra_lod_bias = 0.0f);
+
+    /// gow3: the garbage collection period. A sampler GetSampler returned in this period stays
+    /// alive for at least 16 more (the sampler GC), so its handle may be reused within it.
+    [[nodiscard]] u64 GcTick() const noexcept {
+        return std::atomic_ref<u64>(const_cast<u64&>(gc_tick)).load(std::memory_order_relaxed);
+    }
 
     /// Retrieves the image with the specified id.
     Image* TryGetImage(ImageId id, u64 uid) {
@@ -415,10 +472,36 @@ private:
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 
+    /// gow3 GOW3_IMAGE_WATCH=WxH[:min_layers] (diagnostics, Mausoleum lighting): images of that
+    /// size (and at least that many layers) get a timed log line for every event that can set or
+    /// lose their contents (created, CPU / GPU dirty, uploaded from guest memory, bound as a render
+    /// target or storage image, copied into, unmapped, freed); GOW3_IMAGE_WATCH_LINES caps them
+    /// (default 4000).
+    bool Watched(const ImageInfo& info) const;
+    void WatchNote(const Image& image, const char* event, const std::string& detail = {});
+
     void FreeImage(ImageId image_id, u32 line = __builtin_LINE()) {
         const auto& image = slot_images[image_id];
         if (image_stats) {
             NoteImageChurn(false, line, image.info);
+        }
+        if (Watched(image.info)) {
+            WatchNote(image, "freed", "at texture_cache line " + std::to_string(line));
+        }
+        // gow3 GOW3_UNDEFINED_GPU_FREED (default on; 0: off): the guest memory under a GPU-written
+        // image never received the GPU's data (no write-back), so a new image made there holds
+        // stale bytes, as after an unmap (C3): flagged Undefined at creation, a render / depth
+        // target binding skips its upload. t-up3b: UE4's render-target pool reused memory without
+        // an unmap; 4K targets uploaded 32-64 MB each right before being rendered into.
+        static const bool gpu_freed = [] {
+            const char* env = std::getenv("GOW3_UNDEFINED_GPU_FREED");
+            return !(env && env[0] == '0');
+        }();
+        if (gpu_freed && True(image.flags & ImageFlagBits::GpuModified)) {
+            if (gpu_freed_addresses.size() > 16384) {
+                gpu_freed_addresses.clear();
+            }
+            gpu_freed_addresses.insert(image.info.guest_address);
         }
         ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                          ReadbackSource::ImageFree);
@@ -468,12 +551,51 @@ private:
     /// gow3: GOW3_STALE_READBACK=1 (needs deferred readbacks). A pending copy only blocks CPU
     /// writes: CPU reads see the version the GPU published last (one frame late) instead of
     /// waiting for the GPU. Writes still wait, so no byte is lost.
+    bool readback_submit_wanted = false;
+
     const bool stale_readbacks = deferred_readbacks && [] {
         const char* value = std::getenv("GOW3_STALE_READBACK");
         return value && value[0] == '1';
     }();
+public:
+    /// gow3 GOW3_CAPTURE_ON_TARGET (diagnostics, Mausoleum lighting): copies a float image of at
+    /// most 256x256 back once (all mips and layers) and logs per mip its NaN and infinity counts
+    /// and finite range, when the GPU is done. Call before the image's layout transition for a
+    /// draw (the copy leaves it in the transfer layout).
+    void LogTexelStats(Image& image);
+
+private:
     template <bool track>
     void WatchReadback(VAddr address, u64 size);
+    /// gow3 (plan-linux-deck.md "Mausoleum lighting"): in stale mode a CPU read of a range whose
+    /// first copy is still pending sees bytes no copy wrote (nothing was published there yet).
+    /// GOW3_READBACK_LOG=1 logs each first copy (queued, published, read by the CPU);
+    /// First copies' CPU reads are watched too (GOW3_READBACK_FIRST_WAIT=0: not), so such a read
+    /// waits for the GPU as without stale mode. Later copies stay stale (frame pacing unchanged).
+    /// A copy read once at a level's load is a first copy: UE4's sky light average brightness
+    /// (a 1x1 target at a new address each load) read as leftover bytes, 0 flooded the walls with
+    /// reflections (Hall of Heroes teal, 01.00 white; research/patches/caches/readback-first-wait.md).
+    const bool readback_log = [] {
+        const char* value = std::getenv("GOW3_READBACK_LOG");
+        return value && value[0] == '1';
+    }();
+    const bool readback_first_wait = stale_readbacks && [] {
+        const char* value = std::getenv("GOW3_READBACK_FIRST_WAIT");
+        return !(value && value[0] == '0');
+    }();
+    /// gow3 GOW3_TINY_TARGET_READBACK=1: tiny color targets and storage images (at most 64
+    /// texels) are copied back to guest memory in their tiled layout too (texture_cache.cpp
+    /// IsTinyTarget). Off by default: it copies many small per-frame targets back every frame
+    /// (a large frame cost on the Deck), and it did not fix the Mausoleum (the GPU's own sky
+    /// light result there is NaN; plan-linux-deck.md). Diagnostics only.
+    const bool tiny_target_readback = [] {
+        const char* value = std::getenv("GOW3_TINY_TARGET_READBACK");
+        return value && value[0] == '1';
+    }();
+    std::unordered_set<VAddr> readback_published; ///< ranges with a published copy (readback_mutex)
+    /// Drops the page watch a queued copy holds (a read watch too for a first copy).
+    template <typename Entry>
+    void UnwatchReadback(const Entry& entry);
     struct ReadbackImageStat {
         VAddr address;
         u32 width, height, bits, copies, cpu_accesses;
@@ -484,12 +606,30 @@ private:
     u64 readbacks_released = 0;
     ReadbackQueue<Vulkan::StagingBufferRef> pending_readbacks;
     std::mutex readback_mutex;
+    struct TrackedReadback {
+        VAddr address = 0;
+        u64 size = 0, pushed = 0, published = 0;
+    };
+    std::array<TrackedReadback, 4> tracked_readbacks{}; ///< guarded by readback_mutex
+    u64 NoteTrackedPush(VAddr address, u64 size);
+    void NoteTrackedPublish(VAddr address, u64 size, u64 seq);
     std::atomic<bool> has_pending_readbacks{false};
+    /// gow3 (impl-stage-b-bundle-2.md C5): the pages of the pending copies (ReadbackQueue::
+    /// Spans), written under readback_mutex after every change that can add pages, read without
+    /// it by the buffer cache's ResolveReadbacks calls (seq odd while it is written).
+    static constexpr std::size_t ReadbackSpanCount = 4;
+    struct ReadbackSpans {
+        std::atomic<u32> seq{0}, count{0};
+        std::array<std::atomic<u64>, ReadbackSpanCount> begin{}, end{};
+    };
+    ReadbackSpans readback_spans;
+    void PublishReadbackSpans();
+    [[nodiscard]] bool ReadbackSpansMiss(VAddr address, u64 size) const;
     u64 readbacks_queued = 0, readbacks_completed = 0, readbacks_waited = 0;
     u64 readbacks_canceled = 0, readbacks_peak_bytes = 0;
     std::chrono::steady_clock::time_point readback_report = std::chrono::steady_clock::now();
     ReadbackSourceStats readback_sources;
-    void RetireReadbacks();
+    void RetireReadbacks(bool polled = false);
     PageTable page_table;
     /// gow3: std::mutex that knows its owner, so the scheduler does not wait for the draw
     /// recording thread while this thread holds the lock that thread may need.
@@ -567,6 +707,47 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    std::unique_ptr<std::atomic<u32>[]> region_gens{new std::atomic<u32>[RegionCount]{}};
+    void BumpRegions(VAddr address, u64 size) noexcept {
+        const u64 first = address >> RegionShift;
+        const u64 last = (address + std::max<u64>(size, 1) - 1) >> RegionShift;
+        for (u64 r = first; r <= last && r - first < RegionCount; ++r) {
+            region_gens[r & (RegionCount - 1)].fetch_add(1, std::memory_order_release);
+        }
+    }
+    /// gow3: GOW3_TEXCACHE_STATS: expands by image and reason since the last report (under mutex).
+    std::unordered_map<std::string, u64> expand_sites;
+    /// gow3: GOW3_TEXCACHE_STATS: images created since the last report, by description and binding;
+    /// images freed by a guest unmap in the last ~30 s (address / size / format / extent key ->
+    /// report number), to count how many come back as new images (under mutex).
+    std::unordered_map<std::string, u64> create_sites;
+    /// gow3: GOW3_TEXCACHE_STATS: images uploaded again (RefreshImage) since the last report, by
+    /// description and the dirty flag that caused it -> {count, bytes} (own lock: refreshes can
+    /// run outside `mutex`).
+    std::unordered_map<std::string, std::pair<u64, u64>> refresh_sites;
+    /// gow3: addresses of images freed by guest unmaps, not yet reused (under mutex).
+    std::unordered_set<VAddr> unmapped_addresses;
+    /// gow3: addresses of GPU-written images freed (GC, overlaps, unmaps), not yet reused
+    /// (under mutex; GOW3_UNDEFINED_GPU_FREED).
+    std::unordered_set<VAddr> gpu_freed_addresses;
+    /// gow3 GOW3_PARK_UNMAPPED (default on; 0: off): render / depth targets a guest unmap frees,
+    /// kept unregistered for the same target at the same address (under mutex). UE4's render
+    /// target pool decommits a pass's targets while unused: the torch shadow maps (512x512 D16)
+    /// and the 4K pair were freed and made again up to ~40 times a second (N-23).
+    struct ParkedImage {
+        ImageId id;
+        std::chrono::steady_clock::time_point since;
+    };
+    std::vector<ParkedImage> parked_images;
+    u64 parked_bytes = 0;
+    std::atomic<u32> parked_count{0}; ///< parked_images.size(), read without the lock
+    u64 create_ns = 0, create_max_ns = 0; ///< GOW3_TEXCACHE_STATS: new images (under mutex)
+    bool ParkImage(ImageId image_id);
+    ImageId TakeParkedImage(const ImageInfo& info);
+    void EvictParkedImages(bool over_budget_only);
+    std::mutex refresh_sites_mutex;
+    std::unordered_map<u64, u64> unmapped_recently;
+    u64 stats_reports = 0;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

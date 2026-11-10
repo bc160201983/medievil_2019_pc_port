@@ -160,6 +160,10 @@ s32 AvPlayer::Pause() {
     return ORBIS_OK;
 }
 
+bool AvPlayer::Suspend() {
+    return m_state != nullptr && m_state->Suspend();
+}
+
 s32 AvPlayer::Resume() {
     if (m_state == nullptr || !m_state->Resume()) {
         return ORBIS_AVPLAYER_ERROR_OPERATION_FAILED;

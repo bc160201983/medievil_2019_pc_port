@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// gow3 U2: debug view of UE4's motion vectors (ue4_motion.comp) on the presented frame, at the
+// display size. Works on the display buffer's raw bytes (UNORM view). Modes:
+// 1 colours over the picture, 2 colours only (red / green: x / y motion, grey = none, 64 pixels
+// to full; blue tint = the game's velocity, no tint = camera motion), 3 last frame moved by the
+// vectors onto this one, 4 the difference of 3 and this frame (x4: black where they match).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D display_tex; // this frame, raw bytes
+layout(binding = 1) uniform texture2D motion_tex;  // render pixels, previous - current; b: game
+layout(binding = 2, rgba8) uniform writeonly image2D out_img;
+layout(binding = 3, rgba8) uniform readonly image2D prev_img; // last frame, raw bytes
+layout(binding = 4, rgba8) uniform writeonly image2D next_img;
+
+layout(push_constant) uniform Constants {
+    vec2 display_size;
+    vec2 view_size;   // the rendered rectangle in the motion image
+    uint mode;
+    uint history;     // prev_img holds last frame
+    uint swap_red_blue; // the presenter views the bytes as BGRA: drawn colours swapped to match
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(display_size)))) {
+        return;
+    }
+    const vec4 current = texelFetch(display_tex, pixel, 0);
+    imageStore(next_img, pixel, current);
+    const vec2 to_render = view_size / display_size;
+    const ivec2 render_pixel = ivec2((vec2(pixel) + 0.5) * to_render);
+    const vec4 motion = texelFetch(motion_tex, render_pixel, 0);
+    vec3 color;
+    if (mode <= 2u) {
+        vec3 vectors = vec3(clamp(vec2(0.5) + motion.xy / 128.0, 0.0, 1.0),
+                            motion.z > 0.5 ? 0.9 : 0.5);
+        if (swap_red_blue != 0u) {
+            vectors = vectors.bgr;
+        }
+        color = mode == 1u ? mix(current.rgb, vectors, 0.7) : vectors;
+    } else {
+        const vec2 moved = vec2(pixel) + 0.5 + motion.xy / to_render;
+        const ivec2 prev_pixel = ivec2(floor(moved));
+        vec4 prev = vec4(0.0);
+        if (history != 0u && all(greaterThanEqual(prev_pixel, ivec2(0))) &&
+            all(lessThan(prev_pixel, ivec2(display_size)))) {
+            prev = imageLoad(prev_img, prev_pixel);
+        }
+        color = mode == 3u ? prev.rgb : clamp(abs(prev.rgb - current.rgb) * 4.0, 0.0, 1.0);
+    }
+    imageStore(out_img, pixel, vec4(color, current.a));
+}

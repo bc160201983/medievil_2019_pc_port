@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <source_location>
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_barrier_tracker.h"
@@ -55,6 +56,15 @@ public:
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                  std::optional<VideoCore::SubresourceRange> subres_range = {});
+    /// gow3 GOW3_DEPTH_SAMPLE_IN_PLACE=1: a depth-aspect sample of an image in
+    /// DepthReadOnlyStencilAttachmentOptimal keeps that layout (its depth aspect is readable in
+    /// shaders) and only records the read; true when it did. T-F4: the kills' effects flipped
+    /// the depth buffer between it and DepthStencilReadOnly ~43k times a 5 s window.
+    bool SampleDepthInPlace(VideoCore::Image* image);
+    /// gow3 GOW3_DEPTH_SAMPLE_IN_PLACE: an image in DepthReadOnlyStencilAttachmentOptimal used only
+    /// as that attachment and by in-place depth samples since its last barrier is bound as that
+    /// attachment again without one (records the access); true when it was.
+    bool KeepStencilAttachment(VideoCore::Image* image, vk::AccessFlags2 access);
 
     /// GOW3_GPU_PROFILE: a profiler segment for a transfer of `image` while it lives; the
     /// segment it interrupted continues afterwards.
@@ -91,6 +101,9 @@ public:
                       const VideoCore::SubresourceRange& dst_range);
     void ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                     const vk::ClearValue& clear_value);
+    /// gow3: the stencil aspect of layer 0 from `width` x `height` bytes at `offset` of `src`.
+    void CopyBufferToStencil(VideoCore::Image* dst, const VideoCore::Buffer* src, u64 offset,
+                             u32 width, u32 height);
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 
@@ -100,7 +113,7 @@ public:
     bool IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                           bool check_read_access = false);
 
-    void FlushBarriers();
+    void FlushBarriers(std::source_location caller = std::source_location::current());
 
     /// gow3: runs before this thread changes image state (layouts, pending image
     /// barriers): the rasterizer joins its texture binding helper there (BindHelper).
@@ -123,6 +136,7 @@ private:
     StagingBufferPool staging_pool;
     BarrierTracker barrier_tracker;
     VideoCore::Image::Barriers image_barriers;
+    std::string first_image_desc; ///< gow3 GOW3_PERF_DIAG: the first image barrier's image
     vk::MemoryBarrier2 memory_barrier{};
     // gow3: ranges inserted into barrier_tracker since its last Clear(); re-inserting a
     // contained range is a no-op, and draws re-bind the same ranges constantly.

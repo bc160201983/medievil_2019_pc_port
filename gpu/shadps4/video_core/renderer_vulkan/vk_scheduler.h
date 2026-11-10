@@ -14,10 +14,14 @@
 #include <source_location>
 #include <utility>
 #include <vector>
+#include <array>
 #include <mutex>
 #include <thread>
 #include <queue>
 
+#include "gow3_cacheline.h"
+#include "gow3_sections.h"
+#include "gow3_signal_wait.h"
 #include "gow3_toggles.h"
 #include "common/assert.h"
 #include "common/interval_set.h"
@@ -709,7 +713,8 @@ public:
     void BeginRendering(const RenderState& new_state);
 
     /// Ends current rendering scope.
-    void EndRendering();
+    /// `caller`: for GOW3_PERF_DIAG (render passes ended, by caller).
+    void EndRendering(std::source_location caller = std::source_location::current());
 
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
@@ -748,6 +753,10 @@ public:
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
+        GOW3_SECTION(RecordCall);
+        if (Gow3Sections::Enabled() && Gow3Sections::recording_thread) {
+            Gow3Sections::record_calls.fetch_add(1, std::memory_order_relaxed);
+        }
         if (!recording_threaded || direct_mode) {
             func(current_cmdbuf);
             return;
@@ -847,7 +856,18 @@ public:
 
     /// Hands recorded commands to the recording thread. Called at points where no caller holds
     /// the raw command buffer (end of draws and dispatches); small batches are kept.
-    void KickRecording(bool force = false);
+    void KickRecording(bool force = false) {
+        Kick(force ? KickKind::Now : KickKind::Batched);
+    }
+
+    /// gow3 (impl-deck-cpu-bundle.md): makes now a recorder wake that a lean-mode label kick
+    /// left owed. Stage B calls it when it runs out of packets, Wait() before it blocks; it
+    /// touches no recording state, so any thread may.
+    void WakeDeferredRecorder() {
+        if (wake_deadline_ns.load(std::memory_order_relaxed)) {
+            WakeDeferredRecorderSlow();
+        }
+    }
 
     /// gow3: whether this thread is the one recording into the current chunk (the last to kick
     /// recording). Other threads (draw preparation workers) must not Record(): KickRecording
@@ -862,8 +882,19 @@ public:
     /// gow3: guest memory copies on the recording thread (small ones, RecordHostCopy) or the
     /// copy threads (Gow3Copy::Async) must be done before the guest learns the GPU is past them
     /// (it may then rewrite the memory, e.g. UI vertices: flickering) and before the
-    /// submission that reads them. Waits for all.
-    void WaitHostCopies();
+    /// submission that reads them. Waits for all. `caller`: for GOW3_PERF_DIAG.
+    void WaitHostCopies(std::source_location caller = std::source_location::current());
+
+    /// gow3: guest memory [address, address + size) a host copy issued now will read (the
+    /// source of a deferred upload). WaitHostCopiesFor waits only for these.
+    void NoteHostCopySource(u64 address, u64 size);
+    /// Waits for the host copies when one of them may still read [address, address + size): a
+    /// write there (the command processor's WRITE_DATA) must not change what they copy. Writes
+    /// elsewhere do not wait: the hardware's command processor writes do not wait for earlier
+    /// draws either, so the game cannot take one for a sign that the GPU is past them (fences,
+    /// which it can, still wait for all). Ported from the Bloodborne port.
+    void WaitHostCopiesFor(u64 address, u64 size,
+                           std::source_location caller = std::source_location::current());
 
     /// Runs `copy` on the recording thread in order with the commands (the thread spins for
     /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
@@ -873,13 +904,17 @@ public:
                 seq = ++host_copies_issued](vk::CommandBuffer) {
             copy();
             host_copies_done.store(seq, std::memory_order_release);
+            Gow3SignalWait::Notify(); // a recording thread may sleep in WaitHostCopies
         });
     }
 
     /// gow3: runs `signal` once the guest memory copies issued so far are done, without
     /// waiting here: the recording thread reaches it after the copies queued before it and hands
     /// it to the copy threads' completion (Gow3Copy::AfterCopies).
-    void SignalAfterHostCopies(std::function<void()> signal);
+    /// `urgent` false: a label the guest only polls (no interrupt, no idle or frame step). In
+    /// the recorder's lean mode its chunk is still handed over at once, but a sleeping recorder
+    /// is left asleep until the next wake that is due anyway (Kick, KickKind::Label).
+    void SignalAfterHostCopies(std::function<void()> signal, bool urgent = true);
 
     /// gow3: before a guest-visible write that is not deferred (WriteData, end-of-shader
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
@@ -896,6 +931,11 @@ public:
     [[nodiscard]] bool WillBeginRendering(const RenderState& state) const {
         return !(is_rendering && render_state == state);
     }
+
+    /// gow3 GOW3_PERF_DIAG: the last pass ended and where (PassReopens: reopened on its targets).
+    RenderState last_ended{};
+    const char* last_end_file = nullptr;
+    unsigned last_end_line = 0;
 
     /// CommandBuffer() calls that waited for a recording thread (GOW3_FRAME_STATS).
     static inline std::atomic<u64> direct_recordings{0};
@@ -914,9 +954,74 @@ public:
         return work_semaphore.IsFree(tick);
     }
 
+    /// gow3 (study-stage-b-per-draw.md C1): IsFree for polls that only decide whether finished
+    /// work is picked up now or at a later poll (stage B's end-of-pipe readback retirement, ~200
+    /// events a heavy frame). The GPU is asked at most once per GOW3_SEMAPHORE_POLL_US (default
+    /// 100; a query by any thread counts); in between the last known tick answers, and a tick it
+    /// does not cover reads as not finished yet: never early, at most that much late. The query
+    /// is an ioctl on Linux (RADV: DRM_IOCTL_SYNCOBJ_QUERY). Second toggle word bit 16: off, live.
+    [[nodiscard]] bool IsFreePolled(u64 tick) noexcept {
+        if (work_semaphore.IsFree(tick)) {
+            return true;
+        }
+        static const u64 interval_ns = [] {
+            const char* env = std::getenv("GOW3_SEMAPHORE_POLL_US");
+            return (env && *env ? std::strtoull(env, nullptr, 10) : u64{100}) * 1000;
+        }();
+        if (interval_ns && !Gow3Toggle2::Disabled(Gow3Toggle2::SemaphorePollInterval) &&
+            work_semaphore.RefreshedWithin(interval_ns)) {
+            if (Gow3Stats::enabled) {
+                Gow3Stats::semaphore_polls_skipped.fetch_add(1, std::memory_order_relaxed);
+            }
+            return false;
+        }
+        work_semaphore.Refresh();
+        return work_semaphore.IsFree(tick);
+    }
+
+    /// gow3: told when a render pass begins and before it ends (vk_occlusion.h: queries live in
+    /// render passes). Called on the recording thread.
+    struct RenderPassHook {
+        virtual void OnBeginRendering() = 0;
+        virtual void OnEndRendering() = 0;
+
+    protected:
+        ~RenderPassHook() = default;
+    };
+    void SetRenderPassHook(RenderPassHook* hook) {
+        render_pass_hook = hook;
+    }
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+
+    /// gow3: when the submission signalling `tick` was handed to the queue (steady clock, ns);
+    /// 0 when not submitted yet or too old (a ring of the last 4096 ticks). For latency stats.
+    [[nodiscard]] s64 SubmitTime(u64 tick) const noexcept {
+        const auto& entry = submit_times[tick % submit_times.size()];
+        return entry.tick.load(std::memory_order_acquire) == tick
+                   ? entry.ns.load(std::memory_order_relaxed)
+                   : 0;
+    }
+
     /// Returns the scheduler timeline semaphore.
     [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
         return &work_semaphore;
+    }
+
+    /// gow3 GOW3_GPU_FENCES: this scheduler's submissions count in the report's submits per frame
+    /// (the rasterizer's, with GOW3_FRAME_STATS=1).
+    void CountSubmits() noexcept {
+        count_submits = true;
+    }
+
+    /// gow3 U2 (direct arena writes, buffer_cache.cpp): every submission ends with a barrier that
+    /// makes the device's memory writes available to the host. A semaphore signal seen by the
+    /// host is only an execution dependency; without the barrier a GPU write the buffer cache saw
+    /// finished could still be written back from a GPU cache over a later CPU write to the same
+    /// bytes. Set once at start, before the first submission.
+    void SetHostAccessBarrier(bool enabled) noexcept {
+        host_access_barrier = enabled;
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
@@ -964,16 +1069,27 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
-    u32 pending_polls = 0; // gow3
+    // gow3 #6 (gow3_cacheline.h): GOW3_CACHE_LINE starts a group of fields written by one thread
+    // and read by another: here what every draw reads (PopPendingOperations), apart from the
+    // mutexes other threads take.
+    GOW3_CACHE_LINE u32 pending_polls = 0; // gow3
     std::atomic<u32> num_pending_ops{0}; ///< gow3: pending_ops.size(), checked without the lock
-    std::queue<PendingOp> priority_pending_ops;
+    GOW3_CACHE_LINE std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
-    // gow3: threaded recording
-    std::unique_ptr<RecordChunk> record_chunk;
+    RenderPassHook* render_pass_hook = nullptr;
+    struct SubmitTimeEntry {
+        std::atomic<u64> tick{0};
+        std::atomic<s64> ns{0};
+    };
+    std::array<SubmitTimeEntry, 4096> submit_times{};
+    // gow3: threaded recording. #6: from here to wake_deadline_ns, the recording thread's fields
+    // (every Record and Kick); then the recorder's (recorder_mutex group), then direct_mode and
+    // host_copies_issued (the recording thread again), then host_copies_done (the recorder).
+    GOW3_CACHE_LINE std::unique_ptr<RecordChunk> record_chunk;
     // gow3: record_chunk and full_chunks are used by one producer at a time, but a second thread
     // recording while KickRecording() had handed the chunk to the recorder (record_chunk briefly
     // null) wrote into a null chunk: EndRendering crash in a MediEvil level (issue #2). A spin
@@ -1002,7 +1118,8 @@ public:
     /// gow3: `sync` runs before a thread records or touches the render pass: on the GPU command
     /// thread it waits until the draw recording thread has recorded its queued draws, which
     /// keeps commands in order (issue #2/#12). Returns true when it could not (then logged).
-    void SetDrawPipeSync(bool (*sync)(void*), void* context) {
+    /// `drain` false: never waits, true when a wait would be needed (DrawRecorderQuiet).
+    void SetDrawPipeSync(bool (*sync)(void*, bool drain), void* context) {
         draw_pipe_sync_context = context;
         draw_pipe_sync = sync;
     }
@@ -1010,9 +1127,16 @@ public:
     /// Waits for the draw recording thread as above; callers that take a lock the draw
     /// recording thread also takes call this first.
     void SyncWithDrawRecorder(void* caller = __builtin_return_address(0)) {
-        if (draw_pipe_sync && draw_pipe_sync(draw_pipe_sync_context)) {
+        if (draw_pipe_sync && draw_pipe_sync(draw_pipe_sync_context, true)) {
             ReportInterleave(caller);
         }
+    }
+
+    /// gow3 U2: true when this thread may act now as if it came after every queued draw: it is
+    /// the draw recording thread, or that thread has nothing queued. Does not wait. A direct
+    /// arena write records no command, so it gets no SyncWithDrawRecorder from Record().
+    [[nodiscard]] bool DrawRecorderQuiet() const {
+        return !draw_pipe_sync || !draw_pipe_sync(draw_pipe_sync_context, false);
     }
 
 private:
@@ -1020,7 +1144,7 @@ private:
     void ReportStaleRecordData(void* caller);
     /// The chunk holding this thread's last RecordData() for the command that follows.
     static inline thread_local const RecordChunk* record_data_chunk = nullptr;
-    bool (*draw_pipe_sync)(void*){};
+    bool (*draw_pipe_sync)(void*, bool){};
     void* draw_pipe_sync_context{};
     struct ChunkGuard {
         std::atomic_flag& flag;
@@ -1034,24 +1158,52 @@ private:
         }
     };
     std::atomic<std::thread::id> recording_owner{}; // see OwnsRecording()
+    /// gow3 (impl-deck-cpu-bundle.md): Batched hands chunks over once 32 KiB are recorded (end
+    /// of draws and dispatches); Now always, and wakes a sleeping recorder (waits, fences,
+    /// submissions); Label as Now, except that in lean mode a sleeping recorder is left asleep
+    /// until wake_deadline_ns (checked at every later kick), stage B's next idle or Wait().
+    enum class KickKind { Batched, Now, Label };
+    void Kick(KickKind kind);
+    void WakeDeferredRecorderSlow();
+    /// Lean mode: when (Semaphore::NowNs) a sleeping recorder with chunks queued must be woken;
+    /// 0 when no wake is owed. Written under recorder_mutex, read anywhere.
+    GOW3_CACHE_LINE std::atomic<u64> wake_deadline_ns{0};
     std::vector<std::unique_ptr<RecordChunk>> full_chunks;
-    std::mutex recorder_mutex;
+    GOW3_CACHE_LINE std::mutex recorder_mutex;
     std::condition_variable_any recorder_cv;
     std::condition_variable_any recorder_idle_cv;
     std::deque<std::unique_ptr<RecordChunk>> recorder_queue;
     std::vector<std::unique_ptr<RecordChunk>> free_chunks;
     bool recorder_busy = false;
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
+    /// recorder_busy for lock-free polling (a hint: SyncRecording's spin, gow3 #4)
+    std::atomic<bool> recorder_running{false};
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
-    bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
+    GOW3_CACHE_LINE bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
-    std::atomic<u64> host_copies_done{0};
+    GOW3_CACHE_LINE std::atomic<u64> host_copies_done{0};
+    /// gow3: the sources of the pending host copies (NoteHostCopySource), by 64 KiB granule in a
+    /// direct-mapped table; a slot two pending granules share matches any. A note is pending
+    /// while its seq is above host_copy_sources_done (WaitHostCopies raises it).
+    struct HostCopySlot {
+        u64 granule = 0;
+        u64 seq = 0;
+    };
+    static constexpr u32 HostCopySlots = 4096;
+    static constexpr u64 HostCopyWildcard = ~0ull;
+    GOW3_CACHE_LINE std::mutex host_copy_sources_mutex;
+    std::array<HostCopySlot, HostCopySlots> host_copy_slots{};
+    u64 host_copy_source_seq = 0;
+    u64 host_copy_sources_done = 0;
+    u64 host_copy_big_seq = 0; ///< latest note too large for the table (matches everything)
     std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
     std::shared_ptr<std::atomic<u64>> deferred_signals_done =
         std::make_shared<std::atomic<u64>>(0);
     // gow3: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
     // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
     bool recording_threaded{false};
+    bool count_submits{false}; ///< see CountSubmits()
+    bool host_access_barrier{false}; ///< see SetHostAccessBarrier()
     std::jthread recorder_thread;
     tracy::VkCtxScope* profiler_scope{};
 };

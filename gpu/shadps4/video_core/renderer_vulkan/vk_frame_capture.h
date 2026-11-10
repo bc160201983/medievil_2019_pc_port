@@ -38,6 +38,17 @@ public:
 
     static void BeginPass(const VideoCore::ImageInfo* const* colors, u32 num_colors,
                           const VideoCore::ImageInfo* depth);
+    /// gow3 GOW3_CAPTURE_ON_TARGET=WxH (diagnostics): whether passes are checked for a target of
+    /// that size; StartForTarget starts recording at such a pass (load-time work such as UE4's
+    /// sky light capture, which no flip-armed capture reaches), at most
+    /// GOW3_CAPTURE_ON_TARGET_COUNT times (default 2).
+    static bool TargetWatch();
+    static void StartForTarget(const VideoCore::ImageInfo* const* colors, u32 num_colors);
+    /// Whether the current recording was started by StartForTarget (the rasterizer then logs the
+    /// sampled float textures' texel statistics, TextureCache::LogTexelStats).
+    static bool TargetRecording() {
+        return target_recording && state.load(std::memory_order_relaxed) == Recording;
+    }
     static void Draw(u64 vs_hash, u64 ps_hash, u32 num_indices, u32 num_instances);
     static void Dispatch(u64 cs_hash, u32 x, u32 y, u32 z);
     static void Sampled(const VideoCore::ImageInfo& info, bool storage);
@@ -56,6 +67,7 @@ private:
     static inline std::atomic<u64> flips{0};
     static inline std::atomic<VAddr> last_presented{0};
     static inline std::atomic<bool> requested{false};
+    static inline bool target_recording = false; ///< GPU thread only
 };
 
 } // namespace Vulkan

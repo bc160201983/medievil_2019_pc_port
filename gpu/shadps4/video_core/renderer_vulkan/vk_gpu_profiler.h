@@ -58,7 +58,8 @@ public:
 private:
     GpuProfiler(const Instance& instance, Scheduler& scheduler);
     void WriteTimestamp(u64 key);
-    void Collect(u32 slice);
+    /// Reads a frame's timestamps without waiting; false while the GPU has not written them all.
+    bool Collect(u32 slice);
     void Print();
 
     static constexpr u32 NumSlices = 4;
@@ -73,6 +74,8 @@ private:
     std::array<std::vector<u64>, NumSlices> keys; ///< label of each timestamp but the last
     std::array<u32, NumSlices> used{};
     std::array<bool, NumSlices> pending{};
+    /// The current frame is not profiled: its slice still holds an older frame not read yet.
+    bool skip_frame = false;
     std::unordered_map<u64, std::string> described;
     struct Total {
         double ms = 0;
@@ -80,6 +83,15 @@ private:
     };
     std::unordered_map<u64, Total> totals;
     u64 frames = 0;
+    /// Slow GPU frames (bursts of 7-10 ms in fights, N-17/N-18): the scene part of a frame (a
+    /// profiled frame with >= 1 ms of GPU work; the UI pass after the display pass is its own)
+    /// is slow at >= 1.35x the median of the last 128 scene parts. Labels are summed for slow
+    /// and for other scene parts, printed side by side (largest growth first).
+    std::unordered_map<u64, Total> scene_totals, slow_totals;
+    u64 scene_frames = 0, slow_frames = 0;
+    std::array<double, 128> recent_scene{};
+    u32 recent_count = 0, recent_next = 0;
+    std::vector<std::pair<u64, double>> frame_segments;
     u64 current = 0;
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };

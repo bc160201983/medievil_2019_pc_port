@@ -213,6 +213,19 @@ bool AvPlayerState::Pause() {
     return true;
 }
 
+// gow3: stops handing out frames without a state change or an event (the game sees nothing): its
+// decoder threads then block on their buffers. MediEvil never stops its intro movie after the skip
+// (research/docs/study-intro-movie.md); the level change suspends it. Start() clears it (Stop).
+bool AvPlayerState::Suspend() {
+    std::shared_lock lock(m_source_mutex);
+    if (m_up_source == nullptr || m_up_source->IsPaused() ||
+        (m_current_state != AvState::Play && m_current_state != AvState::Buffering)) {
+        return false;
+    }
+    m_up_source->Pause();
+    return true;
+}
+
 // Called inside GAME thread
 bool AvPlayerState::Resume() {
     std::shared_lock lock(m_source_mutex);

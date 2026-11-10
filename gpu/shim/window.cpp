@@ -1,4 +1,5 @@
 // gow3: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -64,12 +65,39 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         Gow3Settings::Get().display_mode == Gow3Graphics::Windowed) {
         Gow3Settings::Get().display_mode = Gow3Graphics::Borderless;
     }
+    FitWindowedSize(width_, height_);
     ApplyDisplayMode(Gow3Settings::Get().display_mode);
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
+}
+
+// gow3: the windowed size in pixels is the game's output (VideoOut) size, so a 1440p game shows 1:1
+// in its window. SDL sizes windows in points: with Windows display scaling a point is several
+// pixels. A window that does not fit the desktop's work area (with its frame) keeps the aspect
+// ratio at the largest size that fits.
+void WindowSDL::FitWindowedSize(s32 pixel_width, s32 pixel_height) {
+    int points_w = 0, points_h = 0, pixels_w = 0, pixels_h = 0;
+    SDL_GetWindowSize(window, &points_w, &points_h);
+    SDL_GetWindowSizeInPixels(window, &pixels_w, &pixels_h);
+    const double density = points_w > 0 && pixels_w > 0 ? double(pixels_w) / points_w : 1.0;
+    double w = pixel_width / density, h = pixel_height / density;
+    SDL_Rect usable{};
+    int top = 0, left = 0, bottom = 0, right = 0;
+    SDL_GetWindowBordersSize(window, &top, &left, &bottom, &right);
+    if (SDL_GetDisplayUsableBounds(SDL_GetDisplayForWindow(window), &usable)) {
+        const double fit = std::min({1.0, (usable.w - left - right) / w, (usable.h - top - bottom) / h});
+        w *= fit;
+        h *= fit;
+    }
+    SDL_SetWindowSize(window, int(w + 0.5), int(h + 0.5));
+    SDL_SetWindowPosition(window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    SDL_SyncWindow(window);
+    SDL_GetWindowSizeInPixels(window, &pixels_w, &pixels_h);
+    std::printf("Window: windowed size %dx%d pixels for a %dx%d game image\n", pixels_w, pixels_h, pixel_width,
+                pixel_height);
 }
 
 // Windowed, borderless (desktop-sized, no mode change) or exclusive fullscreen at the desktop
@@ -160,6 +188,9 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
+        if (event.type == SDL_EVENT_MOUSE_MOTION) {
+            last_mouse_motion_ms = SDL_GetTicks();
+        }
         if (Gow3Overlay::HandleEvent(event)) {
             continue;
         }
@@ -180,7 +211,24 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+    UpdateCursor();
     return is_open;
+}
+
+// The OS cursor over the game (from the Bloodborne port, 4d4d208): hidden in borderless and
+// fullscreen, and in a window after 3 s without moving the mouse; always shown while the menu,
+// the save list or a text entry is open. Without input focus (alt-tab, another window clicked)
+// the cursor is left shown; it hides again once the player is back in the game window.
+void WindowSDL::UpdateCursor() {
+    const SDL_WindowFlags flags = SDL_GetWindowFlags(window);
+    const bool focused = (flags & SDL_WINDOW_INPUT_FOCUS) != 0;
+    const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0;
+    const bool hide = focused && !Gow3Overlay::CapturesInput() &&
+                      (fullscreen || SDL_GetTicks() - last_mouse_motion_ms > 3000);
+    if (hide != cursor_hidden) {
+        cursor_hidden = hide;
+        hide ? SDL_HideCursor() : SDL_ShowCursor();
+    }
 }
 
 } // namespace Frontend

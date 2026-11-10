@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdlib>
 #include <deque>
 
 #include <condition_variable>
@@ -103,6 +105,48 @@ public:
     void PresentLoadingFrame();
     Frame* PrepareLastFrame();
 
+    /// gow3 GOW3_LIMIT_IN_PRESENT: the next Present waits until `deadline` just before
+    /// vkQueuePresentKHR, after its acquire and blit (where the RTSS limiter waits); {}: none.
+    void SetPresentDeadline(std::chrono::steady_clock::time_point deadline) {
+        present_deadline = deadline;
+    }
+
+    /// gow3 Reflex (GOW3_REFLEX): the driver's minimum frame interval; its sleep after a present.
+    void SetLatencyInterval(u32 interval_us) {
+        swapchain.SetLatencyInterval(interval_us);
+    }
+    bool LatencySleep() {
+        return swapchain.LatencySleep();
+    }
+    /// gow3: the driver has Reflex (VK_NV_low_latency2) enabled for this device.
+    bool ReflexEnabled() const {
+        return instance.IsLowLatency2Enabled();
+    }
+    /// gow3 GOW3_REFLEX_SLEEP_BEFORE_PRESENT=1: the Reflex sleep runs inside Present, right before
+    /// vkQueuePresentKHR (where the RTSS Reflex limiter sleeps), not after it.
+    static bool ReflexSleepBeforePresent() {
+        static const bool enabled = [] {
+            const char* env = std::getenv("GOW3_REFLEX_SLEEP_BEFORE_PRESENT");
+            return env && env[0] == '1';
+        }();
+        return enabled;
+    }
+
+    /// gow3 flip trace: the guest flip argument of the next Present (display times).
+    void SetPresentTag(s64 tag) {
+        swapchain.SetPresentTag(tag);
+    }
+
+    /// gow3 newest-frame mode (GOW3_NEWEST_FRAME): waits until the frame's image is finished on
+    /// the GPU or `until` passes; true when finished. Frames finish in the order prepared.
+    bool WaitFrameReady(Frame* frame, std::chrono::steady_clock::time_point until);
+    /// gow3 newest-frame mode: returns a prepared frame to the pool without showing it.
+    void DiscardFrame(Frame* frame);
+
+    /// gow3 flip trace (GOW3_FLIP_TRACE): notes "gpu_ready" once the GPU has finished the frame's
+    /// work (the game's rendering, then the copy out of its buffer), on a thread of its own.
+    void TraceGpuReady(const Frame* frame, s64 flip_arg);
+
 private:
     Frame* GetRenderFrame();
 
@@ -138,6 +182,20 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+
+    /// Waits until `tick` of `semaphore` (one of the schedulers' work semaphores) or `until`.
+    bool WaitReady(vk::Semaphore semaphore, u64 tick, std::chrono::steady_clock::time_point until);
+    void GpuReadyThread(std::stop_token token);
+    struct GpuReadyEntry {
+        vk::Semaphore semaphore;
+        u64 tick;
+        s64 flip_arg;
+    };
+    std::mutex gpu_ready_mutex;
+    std::condition_variable_any gpu_ready_cv;
+    std::deque<GpuReadyEntry> gpu_ready_queue;
+    std::chrono::steady_clock::time_point present_deadline{}; ///< SetPresentDeadline
+    std::jthread gpu_ready_thread; ///< last: stopped first
 };
 
 } // namespace Vulkan

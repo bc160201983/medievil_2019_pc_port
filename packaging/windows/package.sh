@@ -50,6 +50,11 @@ cp launcher/medievil.ico launcher/medievil.png "$dest/launcher/"
 for exe in medievil-runtime.exe medievil-gpu-check.exe; do
     llvm-strip --strip-debug -o "$dest/bin/$exe" "out/$exe"
 done
+# The DLSS bridge (gpu/dlss_bridge, ours, MIT; built by build_dlss.sh with MSVC) ships when built.
+# NVIDIA's nvngx_dlss.dll does not (below): players copy it into bin\ themselves.
+if [[ -f out/gow3_dlss.dll ]]; then
+    cp out/gow3_dlss.dll "$dest/bin/"
+fi
 # Every DLL the executables load from the CLANG64 tree (SDL3, FFmpeg, Vulkan loader, ...).
 ldd "$dest/bin/medievil-runtime.exe" "$dest/bin/medievil-gpu-check.exe" |
     awk '/\/clang64\/bin\// {print $3}' | sort -u | while read -r dll; do

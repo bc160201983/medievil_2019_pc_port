@@ -1,13 +1,45 @@
 # MediEvil (PS4) for PC
 
 A PC port of **MediEvil** (PlayStation 4, 2019, CUSA11227; the European CUSA12982 works too) for
-Windows 10 and 11, built on the
+Windows 10 and 11 and the Steam Deck (Linux), built on the
 [God of War III PC port](https://github.com/FelipePrado0/gow3_pc).
 
 The CPU side is native: the game's original x86-64 executable runs directly on the PC's processor
-and a runtime written for this port replaces the PS4 system libraries, so there is no emulator.
+and a runtime written for this port replaces the PS4 system libraries, so there is no CPU emulator.
 The graphics run on the [shadPS4](https://github.com/shadps4-emu/shadPS4) video core, which
-translates the PS4 GPU commands and shaders to Vulkan.
+emulates the PS4 GPU at a high level: it recompiles the game's shaders and translates its GPU
+commands to Vulkan.
+
+## What's new in 1.4.0
+
+Most of this release is **[BevelTipDrip](https://github.com/BevelTipDrip)'s work** from their fork
+([BevelTipDrip/medievil_2019_pc_port](https://github.com/BevelTipDrip/medievil_2019_pc_port),
+releases 2.0.0 to 2.1.1), merged here with thanks. Their fork documents every fix with its
+measurements in `research/docs/fix-inventory.md`.
+
+- **Fights**: kill effects nearly doubled the render passes in a frame; most of those breaks are
+  gone. A fight at a 120 FPS cap holds 1% / 0.1% lows of 119.7 / 117.4 FPS.
+- **Culling**: Unreal's HZB occlusion culling works (its small mip levels were never rendered),
+  and the hidden decal depth prepass (about 600 draws a frame) is skipped.
+- **Memory sync**: no GPU downloads when the game writes memory the GPU wrote, no 2-5 s stalls
+  when Windows trims the game's memory, cheaper lock and memory-pool lookups.
+- **Draw translation**: less CPU work per draw (texture-set memo, register scans, deferred fences,
+  bulk descriptor copies, sampler memo).
+- **Fixes**: shadows drawn as black boxes; a crash and freeze in the draw pipe; GPU particles that
+  vanished with the camera angle ("GPU particle bounds" patch); walls flooded with light after a
+  level load (teal Hall of Heroes, white walls, purple reflections); the torch and crypt-floor
+  particle glitch; the in-game menu no longer adds frames.
+- **Developer cheat menu on 01.02**: **L1 + R1 + R3** in a level (01.00: R3).
+- **NVIDIA DLSS / DLAA** (RTX cards, off by default): launcher > Graphics > NVIDIA DLSS, the
+  in-game menu, or F9. NVIDIA's `nvngx_dlss.dll` is not included: copy it into `bin`
+  ([README-Windows.txt](packaging/windows/README-Windows.txt)).
+- **Graphics quality levels** with 18 individual settings (Console = the PS4's exact values), and
+  live render scale from 50% to 200%.
+- **Frame pacing above 60 FPS**: NVIDIA Reflex limiter, an automatic frame limit, presents on a
+  precise vblank tick.
+- **Steam Deck / Linux**: the native AppImage works again, with a Deck Optimized preset.
+- Every optimisation is a switch (launcher > Performance > Performance patches, or a `GOW3_*`
+  variable).
 
 > **No game files are included.** You need your own copy of MediEvil (CUSA11227), as an unpacked
 > folder or a fake package (.pkg). This project is not affiliated with Sony Interactive
@@ -58,21 +90,21 @@ Captured on Windows 11 (RTX 5080) with this port.
 - **Update notice**: the launcher asks GitHub for a newer release when it opens and offers to
   download and install it (Advanced > Check for updates; can be switched off).
 - **Install from PKG**: the launcher (or `run.py`) unpacks a fake PKG once, resumably.
-- **Render resolution up to 4K**: the 3D scene is drawn at up to 3840 × 2160 and scaled to the
-  game's 1080p picture (a UE4 config override pak, `scripts/ue4_override.py`): sharpest on a
-  1080p screen.
-- **Native output 720p, 1440p, 1800p and 4K** (for 1440p/4K monitors and TVs): the game itself
-  switches to that size a few seconds after start, through its own `r.SetRes` console variable.
-  The in-game menu (Performance > Game resolution now) switches between 1080p, 1440p, 1800p and
-  4K at any time. Native 4K needs a larger PS4 framebuffer pool: the built-in patch
-  `patches/MediEvil.xml` ("Native 4K framebuffer pool (512 MB)", on by default) raises it from
-  128 MB.
-- **Temporal upscaling** (launcher > Performance > Upscaling): the game's own UE4 temporal
-  upsampling renders the 3D scene at 67%, 58% or 50% and rebuilds the full picture from its
-  motion vectors, for native output and slower graphics cards.
+- **Any output resolution** (launcher > Output resolution: 720p, 1080p, 1440p, 1800p, 4K, your
+  display's size, or any `output_resolution=WxH` in `medievil.ini`): the game starts at that size,
+  as a PS4 starts at its TV's (built-in patch "Boot display size", `patches/MediEvil.xml`), so the
+  menus and controller navigation work at every size. In windowed mode the window opens at it.
+  Above 1080p the port also uses a larger PS4 framebuffer pool ("Native 4K framebuffer pool
+  (512 MB)") and more game memory, by itself.
+- **Render scale** (launcher > Render scale, 50% to 200%): above 100% the 3D scene is drawn larger
+  and scaled down to the output (supersampling, sharpest); below 100% the game's own UE4 temporal
+  upsampling draws it smaller and rebuilds the full picture from its motion vectors (faster). The
+  menus and HUD stay at the output size (a UE4 config override pak, `scripts/ue4_override.py`).
+  The in-game menu (Performance > Game resolution now) can still switch between 1080p, 1440p,
+  1800p and 4K live, for the developer debug menu.
 - **Anti-aliasing** (launcher > Performance > Anti-aliasing): the game's temporal AA (default,
-  smooth), FXAA (sharper) or Off (raw pixels, best with a high render resolution). Upscaling always
-  uses temporal AA.
+  smooth), FXAA (sharper) or Off (raw pixels, best with a high render resolution). A render scale
+  below 100% always uses temporal AA.
 - **Graphics quality**: Low (integrated graphics such as the Radeon 780M), Medium, Console (PS4),
   High and Ultra (sharper, longer-range shadows, better reflections and more distant detail).
   Every preset keeps point/spot light shadows at one fixed size, which stops the shadow flicker
@@ -87,7 +119,8 @@ Captured on Windows 11 (RTX 5080) with this port.
 ### Cheats (launcher > Game > Cheats)
 
 - **Developer cheat menu**: MediEvil's own debug menu, left in the game by its developers and
-  switched on by the override pak. Press **R3** while playing: unlock all levels, level select,
+  switched on by the override pak. Press **R3** in a level (01.02: hold **L1 + R1**, then press
+  **R3**): unlock all levels, level select,
   complete level, unlock all weapons, invincibility, all runes and quest items, life bottles,
   gold, chalices, fly mode and more. Its 60 FPS lock is removed. Enemies pause while the menu is
   open (the developers' design) and carry on when it closes, however it is closed (Complete
@@ -137,8 +170,8 @@ Captured on Windows 11 (RTX 5080) with this port.
   4K native output) finds the game's resolution setting in each version's own code (tested on 01.00;
   the 01.02 address was found by @Porticus in #29). If a game build doesn't have that code, native
   output stays at 1080p and the log says so. On the European 01.02 (CUSA12982) the 4K pool patch,
-  unlimited ammo, the FPS counter edit and the voice option work, but **the developer cheat menu
-  does not open yet** (R3 does nothing). The 01.02 eboot does not export
+  unlimited ammo, the FPS counter edit and the voice option work; the developer cheat menu opens
+  with L1 + R1 + R3 there as on the US 01.02 (not tested on the EU build). The 01.02 eboot does not export
   a few `libSceNpToolkit2` C++ functions the game links; those imports are logged no-ops returning
   0, since the port does not implement that module.
 - **Radeon RX 400/500 and Vega** (older AMD drivers): some crash in `amdvlk64.dll` when the main
@@ -154,7 +187,10 @@ Captured on Windows 11 (RTX 5080) with this port.
 2. Open **`MediEvil.exe`** (Windows may warn that it is not signed: More info, Run anyway).
 3. On **Game**, either **Choose .pkg…** to install from your package, or **Browse…** to the
    folder with `eboot.bin`.
-4. Choose a **Render resolution** on **Home** and press **PLAY**.
+4. Choose an **Output resolution** (your display's size for a sharp picture) and a **Render scale** on
+   **Home** and press **PLAY**.
+5. Optional, NVIDIA RTX: copy NVIDIA's `nvngx_dlss.dll` into the `bin` folder and turn on **NVIDIA DLSS**
+   (launcher > Graphics). DLAA at render scale 100, DLSS upscaling below it.
 
 `Play MediEvil.exe` starts the game with the saved settings, for shortcuts and Steam.
 **Portable mode**: with an empty file `portable.txt` next to `MediEvil.exe`, the launcher keeps its
@@ -171,7 +207,7 @@ More in [packaging/windows/README-Windows.txt](packaging/windows/README-Windows.
 
    ```bash
    git clone --recursive https://github.com/bc160201983/medievil_2019_pc_port
-   cd medievil_pc
+   cd medievil_2019_pc_port
    CXXFLAGS="-include cstdlib -include cstdio -include cwchar -include cmath -include new" bash build.sh
    ```
 
@@ -208,6 +244,9 @@ table.
 
 ## Credits
 
+- **BevelTipDrip**: the performance, correctness, DLSS and Steam Deck work of 1.4.0, from
+  [their fork](https://github.com/BevelTipDrip/medievil_2019_pc_port).
+- **Porticus**: 01.02 support, native output on 01.02, the frame analyzer fix and more pull requests.
 - **FelipePrado0**: [gow3_pc](https://github.com/FelipePrado0/gow3_pc), the God of War III port
   this project is built on, and its credits: **Supermedo** and **deadinside28** (bloodborne_pc),
   **cuesta4** (shadPS4 GPU fixes).

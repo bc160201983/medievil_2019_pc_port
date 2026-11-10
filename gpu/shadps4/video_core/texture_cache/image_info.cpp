@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
+#include <cstdlib>
 #include "common/assert.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/buffer.h"
@@ -205,7 +208,20 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
         return -1;
     }
 
-    if (info.array_mode != array_mode) {
+    // gow3: a macro tiled image lays out its mips smaller than a macro tile micro tiled
+    // (ImageSizeMacroTiled), and a render target for one of them has the micro tiled mode.
+    // UE4's HZB renders its mips one by one: from 64x64 down they were images of their own and
+    // the occlusion test read mips nothing had rendered (t-hzb1-mip-targets).
+    // GOW3_MICRO_MIP_TARGETS=0: off.
+    static const bool micro_mips = [] {
+        const char* env = std::getenv("GOW3_MICRO_MIP_TARGETS");
+        return !(env && env[0] == '0');
+    }();
+    const bool micro_mip_of_macro = micro_mips && info.array_mode != array_mode &&
+                                    AmdGpu::IsMacroTiled(info.array_mode) && !info.props.is_block &&
+                                    array_mode == AmdGpu::ArrayMode::Array1DTiledThin1 &&
+                                    AmdGpu::GetMicroTileThickness(info.array_mode) == 1;
+    if (info.array_mode != array_mode && !micro_mip_of_macro) {
         return -1;
     }
 
@@ -229,6 +245,20 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
             (pitch >> this_dim) == (mip_pitch >> info_dim)) {
             mip = m;
             break;
+        }
+    }
+    if (micro_mip_of_macro && mip >= 0) {
+        // Only a mip the image's own layout made micro tiled (as in UpdateSize).
+        u32 mip_w = std::max(info.pitch >> mip, 1u);
+        u32 mip_h = std::max(info.size.height >> mip, 1u);
+        if (info.props.is_pow2) {
+            mip_w = std::bit_ceil(mip_w);
+            mip_h = std::bit_ceil(mip_h);
+        }
+        const auto [pitch_align, height_align] =
+            GetMacroTileExtents(info.tile_mode, info.num_bits, info.num_samples, info.alt_tile);
+        if (mip == 0 || (mip_w >= pitch_align && mip_h >= height_align)) {
+            return -1;
         }
     }
 

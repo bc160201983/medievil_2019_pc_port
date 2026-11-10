@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// gow3 U2 (plan-ue4-motion-vectors.md): UE4's motion vectors, as its TAA uses them (UE 4.21
+// PostProcessTemporalCommon): the velocity target where the game wrote one (encoded x > 0),
+// else the camera's motion from scene depth and View.ClipToPrevClip. Output in render pixels,
+// previous position minus current (the DLSS / FSR convention), b = 1 where the game wrote velocity.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D velocity_tex; // R16G16_UNORM, UE4-encoded, 0 = not written
+layout(binding = 1) uniform texture2D depth_tex;    // scene depth, reversed Z, infinite far plane
+layout(binding = 2, rgba16f) uniform writeonly image2D motion_img;
+
+layout(push_constant) uniform Constants {
+    vec4 clip_to_prev_clip[4]; // View.ClipToPrevClip rows (row vector times matrix)
+    vec2 view_size;            // View.ViewSizeAndInvSize.xy: the rendered rectangle, from (0, 0)
+    vec2 image_size;           // the velocity / depth images
+    uint has_velocity;         // 0: the TAA pass does not sample a velocity target (menus)
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(image_size)))) {
+        return;
+    }
+    // UE4's screen position: x right, y up, -1..1 over the view rectangle.
+    const vec2 screen = (vec2(pixel) + 0.5) / view_size * vec2(2.0, -2.0) + vec2(-1.0, 1.0);
+    const vec2 encoded = has_velocity != 0u ? texelFetch(velocity_tex, pixel, 0).rg : vec2(0.0);
+    const bool written = encoded.x > 0.0;
+    vec2 back; // current minus previous screen position (UE4's BackN)
+    if (written) {
+        back = encoded * 4.008016 - 2.0039775; // DecodeVelocityFromTexture
+    } else {
+        const float depth = texelFetch(depth_tex, pixel, 0).r;
+        const vec4 prev = screen.x * clip_to_prev_clip[0] + screen.y * clip_to_prev_clip[1] +
+                          depth * clip_to_prev_clip[2] + clip_to_prev_clip[3];
+        back = screen - prev.xy / prev.w;
+    }
+    // Screen units to pixels; screen y is up, pixel y down.
+    const vec2 motion = vec2(-back.x, back.y) * 0.5 * view_size;
+    imageStore(motion_img, pixel, vec4(motion, written ? 1.0 : 0.0, 0.0));
+}

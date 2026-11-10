@@ -26,6 +26,28 @@ Use a newer distribution (Ubuntu 24.04+, Fedora 39+, SteamOS 3.6+, Debian 13, Ar
     exit 1
 fi
 
+# A build for x86-64-v3 CPUs (GOW3_CPU_LEVEL=v3, MediEvil-x86_64-v3.AppImage) says so plainly on an
+# older CPU instead of crashing on its first AVX2 instruction (SIGILL). The x86-64-v3 features as
+# /proc/cpuinfo names them (abm: LZCNT). No cpuinfo: no check.
+level=$(cat "$APPDIR/usr/lib/compat/cpu-level" 2>/dev/null || true)
+if [ "$level" = x86-64-v3 ]; then
+    flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
+    missing=
+    if [ -n "$flags" ]; then
+        for feature in avx avx2 bmi1 bmi2 fma f16c movbe abm xsave; do
+            case " ${flags#*:} " in *" $feature "*) ;; *) missing="$missing $feature" ;; esac
+        done
+    fi
+    if [ -n "$missing" ]; then
+        message="This MediEvil AppImage is built for x86-64-v3 processors (AVX2, BMI2, FMA: Intel Haswell, AMD Zen or newer, such as the Steam Deck). This processor lacks:$missing.
+Use MediEvil-x86_64.AppImage, the build for every x86-64 processor."
+        echo "$message" >&2
+        command -v zenity >/dev/null 2>&1 && zenity --error --title=MediEvil --text="$message" 2>/dev/null
+        command -v kdialog >/dev/null 2>&1 && kdialog --title MediEvil --error "$message" 2>/dev/null
+        exit 1
+    fi
+fi
+
 # The Vulkan loader is the system's (it comes with any Vulkan driver).
 if ! /sbin/ldconfig -p 2>/dev/null | grep -q 'libvulkan.so.1 ' && [ ! -e /usr/lib/x86_64-linux-gnu/libvulkan.so.1 ] \
    && [ ! -e /usr/lib64/libvulkan.so.1 ] && [ ! -e /usr/lib/libvulkan.so.1 ]; then

@@ -1,7 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <cstdlib>
+#include <immintrin.h>
 #include "common/debug.h"
+#include "common/thread.h"
+#include "gow3_flip_trace.h"
+#include "gow3_stage_b_wait.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -616,7 +624,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                     vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
                     image.info.size.height, "display", frame_dump_index);
         }
-        image_view = *image.FindView(view_info).image_view;
+        // gow3 U2: the UE4 motion vector debug view (GOW3_UE4_MOTION_VIEW) reads the display
+        // buffer in a compute pass and is presented in its place.
+        vk::ImageView motion_view{};
+        if (auto* motion = rasterizer->GetUe4Motion()) {
+            runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                            vk::PipelineStageFlagBits2::eFragmentShader |
+                                vk::PipelineStageFlagBits2::eComputeShader,
+                            vk::AccessFlagBits2::eShaderRead);
+            runtime.FlushBarriers();
+            motion_view = motion->Compose(cmdbuf, image, view_info.format);
+        }
+        image_view = motion_view ? motion_view : *image.FindView(view_info).image_view;
         image_size = vk::Extent2D{image.info.size.width, image.info.size.height};
         runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eFragmentShader,
@@ -628,7 +647,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // gow3: FSR 1, RCAS and its strength come from the in-game menu, every frame.
     const auto& graphics = Gow3Settings::Get();
     fsr_settings.enable = graphics.fsr1;
-    fsr_settings.use_rcas = graphics.rcas;
+    // gow3 U3: no RCAS over DLAA (the user's decision: DLSS on, RCAS off).
+    fsr_settings.use_rcas = graphics.rcas && !Ue4Dlss::Running();
     fsr_settings.rcas_attenuation = Gow3Graphics::RcasAttenuation(graphics.rcas_strength);
     Gow3Settings::Get().image_width = int(image_size.width);
     Gow3Settings::Get().image_height = int(image_size.height);
@@ -975,12 +995,65 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
+    // gow3 GOW3_LIMIT_IN_PRESENT: the frame limit's slot, waited for here, after the variable
+    // work above (T-F9: released exactly on time, frames still reached the present 0.35 +- 0.25 ms
+    // later; the RTSS limiter waits at this point and held 8.33 ms). The last 0.5 ms are spun
+    // holding submit_mutex: taken after the slot, waiting for a submission on another thread put
+    // +-0.2 ms back on the frame times (T-F10); the RTSS wait sits inside it.
+    const auto deadline = present_deadline;
+    present_deadline = {};
+    // gow3 GOW3_LIMIT_AFTER_PRESENT=1: present at once, then hold the thread until the slot (the
+    // RTSS limiter's order, back edge: T-F11 showed its present *returns* 8.33 ms apart while ours,
+    // waiting before the call, returned 8.14-8.53 ms apart: the driver's 0.2-0.5 ms inside it).
+    static const bool after_present = [] {
+        const char* env = std::getenv("GOW3_LIMIT_AFTER_PRESENT");
+        return env && env[0] == '1';
+    }();
+    const auto wait_until = [](std::chrono::steady_clock::time_point until) {
+#ifdef _WIN32
+        thread_local HANDLE hires = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS);
+        static const auto spin = std::chrono::microseconds([] {
+            const char* env = std::getenv("GOW3_PACER_SPIN_US");
+            return env ? std::atol(env) : 700L;
+        }());
+        if (const auto now = std::chrono::steady_clock::now(); hires && now < until - spin) {
+            LARGE_INTEGER due;
+            due.QuadPart = -std::max<LONGLONG>(
+                1, std::chrono::duration_cast<std::chrono::nanoseconds>(until - spin - now).count() / 100);
+            if (SetWaitableTimerEx(hires, &due, 0, nullptr, nullptr, nullptr, 0)) {
+                WaitForSingleObject(hires, INFINITE);
+            }
+        }
+#endif
+        while (std::chrono::steady_clock::now() < until) {
+            _mm_pause();
+        }
+    };
+    const bool limited = deadline != std::chrono::steady_clock::time_point{} && !after_present;
+    if (limited) {
+        const auto lock_at = deadline - std::chrono::microseconds(500);
+        wait_until(lock_at);
+    }
+    // gow3 Reflex sleep before the present (T-F23: sleeping after it made the frame starts exact
+    // but left the presents +-0.4 ms off, with flicker; RTSS sleeps in its present hook).
+    if (is_game_frame && ReflexSleepBeforePresent()) {
+        swapchain.LatencySleep();
+    }
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        while (limited && std::chrono::steady_clock::now() < deadline) {
+            _mm_pause();
+        }
+        if (swapchain.PresentTag() >= 0) {
+            Gow3FlipTrace::Note("present_start", swapchain.PresentTag()); // flip trace only
+        }
         if (!swapchain.Present() && window.GetWidth() != 0 && window.GetHeight() != 0) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
+    }
+    if (after_present && deadline != std::chrono::steady_clock::time_point{}) {
+        wait_until(deadline);
     }
 
     free_frame();
@@ -989,12 +1062,108 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 }
 
+bool Presenter::WaitFrameReady(Frame* frame, std::chrono::steady_clock::time_point until) {
+    if (frame == nullptr) {
+        return true;
+    }
+    return WaitReady(frame->ready_semaphore, frame->ready_tick, until);
+}
+
+void Presenter::TraceGpuReady(const Frame* frame, s64 flip_arg) {
+    if (frame == nullptr || !Gow3FlipTrace::File()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{gpu_ready_mutex};
+        if (!gpu_ready_thread.joinable()) {
+            gpu_ready_thread = std::jthread([this](std::stop_token token) { GpuReadyThread(token); });
+        }
+        gpu_ready_queue.push_back({frame->ready_semaphore, frame->ready_tick, flip_arg});
+    }
+    gpu_ready_cv.notify_one();
+}
+
+void Presenter::GpuReadyThread(std::stop_token token) {
+    Common::SetCurrentThreadName("gow3:GpuReady");
+    while (!token.stop_requested()) {
+        GpuReadyEntry next{};
+        {
+            std::unique_lock lock{gpu_ready_mutex};
+            if (!gpu_ready_cv.wait(lock, token, [&] { return !gpu_ready_queue.empty(); })) {
+                return;
+            }
+            next = gpu_ready_queue.front();
+            gpu_ready_queue.pop_front();
+        }
+        // Frames finish in queue order; a frame not finished in a second is left out.
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!token.stop_requested() && std::chrono::steady_clock::now() < give_up) {
+            if (WaitReady(next.semaphore, next.tick,
+                          std::chrono::steady_clock::now() + std::chrono::milliseconds(20))) {
+                Gow3FlipTrace::Note("gpu_ready", next.flip_arg);
+                break;
+            }
+        }
+    }
+}
+
+bool Presenter::WaitReady(vk::Semaphore handle_in, u64 tick,
+                          std::chrono::steady_clock::time_point until) {
+    Semaphore* semaphore = nullptr;
+    for (Scheduler* scheduler : {&draw_scheduler, &flip_scheduler, &present_scheduler}) {
+        if (scheduler->GetWorkSemaphore()->Handle() == handle_in) {
+            semaphore = scheduler->GetWorkSemaphore();
+        }
+    }
+    if (semaphore == nullptr || semaphore->IsFree(tick)) {
+        return true;
+    }
+    semaphore->Refresh();
+    if (semaphore->IsFree(tick)) {
+        return true;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (until <= now) {
+        return false;
+    }
+    const vk::Semaphore handle = semaphore->Handle();
+    const u64 value = tick;
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &handle,
+        .pValues = &value,
+    };
+    const u64 timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(until - now).count();
+    if (instance.GetDevice().waitSemaphores(&wait_info, timeout) != vk::Result::eSuccess) {
+        return false;
+    }
+    semaphore->Refresh();
+    return true;
+}
+
+void Presenter::DiscardFrame(Frame* frame) {
+    // Its present_done fence is still signaled (only Present resets it) and the next use of the
+    // frame is ordered after this one's copy on the same queue.
+    std::scoped_lock fl{free_mutex};
+    free_queue.push(frame);
+    free_cv.notify_one();
+}
+
 Frame* Presenter::GetRenderFrame() {
+    // gow3 #4 (gow3_stage_b_wait.h): on stage B with GOW3_STAGE_B_SPIN=1 both waits below spin
+    // first (the fence is asked every 20 us: an ioctl on RADV); their sleeps are timed.
+    Gow3StageBWait::Spin([this] {
+        std::scoped_lock lock{free_mutex};
+        return !free_queue.empty();
+    }, 2'000);
     // Wait for free presentation frames
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
-        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        if (free_queue.empty()) {
+            Gow3StageBWait::SleepTimer sleep{Gow3StageBWait::Present};
+            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        }
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1010,13 +1179,18 @@ Frame* Presenter::GetRenderFrame() {
         return result;
     };
 
+    Gow3StageBWait::Spin(
+        [&] { return device.getFenceStatus(frame->present_done) == vk::Result::eSuccess; }, 20'000);
     // Wait for the presentation to be finished so all frame resources are free
-    while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
+    {
+        Gow3StageBWait::SleepTimer sleep{Gow3StageBWait::Present};
+        while (wait() != vk::Result::eSuccess) {
+            ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+                       "Device lost during waiting for a frame");
+            // Retry if the waiting times out
+            if (result == vk::Result::eTimeout) {
+                continue;
+            }
         }
     }
 

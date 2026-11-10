@@ -41,6 +41,15 @@ with `eboot.bin`, then press **PLAY**.
    `--play` so Game Mode starts the game directly, without the launcher window.
 4. Leave *Compatibility* off: it is a native Linux program, not a Windows one.
 
+**Settings for the Deck:** on a Steam Deck the launcher selects the *Deck Optimized* graphics
+preset on its first run (with settings from an earlier version it asks once). You can also pick it
+yourself: *Graphics quality → Deck Optimized*. It sets 720p borderless, an 80% render scale, Low
+quality with volumetric fog, a 60 FPS limit with VSync off, and the Deck's performance switches
+(*Performance → Steam Deck performance switches*). For a flat 60 FPS, also set a manual GPU clock
+of about 1,200 MHz in the Quick Access Menu (Performance) and keep the frame limit at 60: with an
+uncapped GPU the Deck's 15 W shifts between GPU and CPU and frame times swing. Picking another
+*Graphics quality* ends the preset.
+
 If Steam reports that the AppImage cannot be mounted (no FUSE, e.g. NixOS), set the launch options
 to `APPIMAGE_EXTRACT_AND_RUN=1 %command% --play`.
 

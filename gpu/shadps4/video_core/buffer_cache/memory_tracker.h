@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "gow3_sections.h"
 #include "gow3_toggles.h"
 #include "common/debug.h"
 #include "common/types.h"
@@ -110,6 +111,7 @@ public:
                                    !manager->template IsRegionModified<Type::CPU>(offset, size)) {
                                    return;
                                }
+                               GOW3_SECTION(ObtUpload);
                                manager->lock.lock();
                                manager->template ForEachModifiedRange<Type::CPU, true>(
                                    manager->GetCpuAddr() + offset, size, func);
@@ -123,6 +125,7 @@ public:
         }
         IteratePages<false>(query_cpu_range, query_size,
                             [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                                GOW3_SECTION(ObtUpload);
                                 manager->template ChangeRegionState<Type::GPU, true>(
                                     manager->GetCpuAddr() + offset, size);
                                 manager->lock.unlock();

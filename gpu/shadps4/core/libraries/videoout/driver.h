@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <functional>
 
@@ -102,6 +103,8 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        /// gow3 newest-frame mode: the guest's flip completed when the frame was queued.
+        bool completed = false;
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -109,10 +112,20 @@ private:
     };
 
     void Flip(const Request& req);
+    /// The guest side of a flip: flip status, flip events, buffer labels (Flip ends with it).
+    void CompleteFlip(const Request& req);
+    /// gow3 newest-frame mode: completes the flip of a frame that is never shown.
+    void DropFlip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    /// gow3 newest-frame mode (GOW3_NEWEST_FRAME=1): releases the newest finished frame at each
+    /// slot of the frame limit, on its own thread (the present thread's vblank tick and its
+    /// coarse waits delayed releases: T-L5 run 2, +-0.75 ms with a finished frame always ready).
+    void PacerThread(std::stop_token token);
+    /// Drops every queued frame older than the newest one finished on the GPU.
+    void DropOlderFinished();
     /// gow3: runs presenter work (acquire, blit, vkQueuePresent) off the vblank thread, in
     /// order. Acquire and present block while the GPU is the bottleneck (much longer on NVIDIA);
     /// on the vblank thread that delayed the guest's vblank events and its frame timing jumped.
@@ -131,7 +144,14 @@ private:
     std::condition_variable request_cv; ///< gow3: a flip was queued (immediate flips)
     VideoOutPort main_port{};
     std::jthread present_thread;
-    std::queue<Request> requests;
+    std::deque<Request> requests;
+    /// gow3 newest-frame mode with a frame limit: flips complete for the guest as soon as the
+    /// frame is copied out (SubmitFlipInternal); the present thread picks among the copies.
+    std::atomic<bool> newest_active{false};
+    /// gow3 GOW3_LIMIT_IN_PRESENT: the slot of the next Flip, waited for in its present ({}: none).
+    std::chrono::steady_clock::time_point flip_deadline{};
+    std::atomic<u32> pacer_limit{0}; ///< the frame limit the pacer keeps (0: none)
+    std::jthread pacer_thread;       ///< last: stopped first
 };
 
 } // namespace Libraries::VideoOut

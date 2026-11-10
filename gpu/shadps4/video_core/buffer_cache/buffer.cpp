@@ -130,6 +130,14 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         .usage = AllFlags,
         .sharingMode = vk::SharingMode::eExclusive,
     };
+    // gow3 D3: arenas are read by the readback queue too (BufferCache::DownloadMemory).
+    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
+                                         instance.GetReadbackQueueFamilyIndex()};
+    if (mem_type == MemoryType::Sparse && instance.GetReadbackQueue()) {
+        buffer_ci.sharingMode = vk::SharingMode::eConcurrent;
+        buffer_ci.queueFamilyIndexCount = 2;
+        buffer_ci.pQueueFamilyIndices = families.data();
+    }
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);
 
@@ -240,6 +248,9 @@ std::optional<u64> StreamBuffer::Reserve(u64 size, u64 alignment, bool allow_wai
 }
 
 void StreamBuffer::AdvanceAndWatch() {
+    if (written_stat) {
+        written_stat->fetch_add(mapped_size, std::memory_order_relaxed);
+    }
     offset += mapped_size;
     const u64 tick = scheduler.CurrentTick();
     last_tick = tick;

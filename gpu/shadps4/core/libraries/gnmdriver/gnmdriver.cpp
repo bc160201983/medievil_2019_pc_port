@@ -23,6 +23,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "gow3_fence_stats.h"
+#include "gow3_decode_pacing.h"
+#include "gow3_gpu_fences.h"
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -80,6 +83,13 @@ static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_wait_idle};
+    if (const u64 armed = Gow3FenceStats::lock_armed_at.exchange(0); armed && submission_lock) {
+        // gow3 gate 2: how long the lock stayed armed (SubmitDone -> GPU idle IRQ).
+        const u64 held = Gow3FenceStats::NowNs() - armed;
+        Gow3FenceStats::lock_held_ns += held;
+        Gow3FenceStats::AtomicMax(Gow3FenceStats::lock_held_max_ns, held);
+        ++Gow3FenceStats::lock_releases;
+    }
     submission_lock = 0;
     cv_lock.notify_all();
 }
@@ -87,7 +97,15 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
+    const u64 start = Gow3Stats::enabled && submission_lock ? Gow3FenceStats::NowNs() : 0;
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+    if (start) {
+        // gow3 gate 2: a submit that found the lock armed.
+        const u64 waited = Gow3FenceStats::NowNs() - start;
+        ++Gow3FenceStats::lock_waits;
+        Gow3FenceStats::lock_wait_ns += waited;
+        Gow3FenceStats::AtomicMax(Gow3FenceStats::lock_wait_max_ns, waited);
+    }
 }
 
 // Write a special ending NOP packet with N DWs data block
@@ -361,6 +379,11 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         });
     }
     liverpool->SubmitAsc(gnm_vqid, acb_span);
+    if (Gow3GpuFences::PacingOnDecode()) {
+        Gow3GpuFences::AfterSubmit(); // handed over first, as the graphics submissions
+    } else if (Gow3DecodePacing::Enabled()) {
+        Gow3DecodePacing::AfterSubmit(false);
+    }
 }
 
 void PS4_SYSV_ABI sceGnmDingDongForWorkload(u32 gnm_vqid, u32 next_offs_dw, u64 workload_id) {
@@ -2304,8 +2327,15 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
         return patch_result;
     }
 
-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    const s32 result =
+        PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+                      const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    if (result == ORBIS_OK && Gow3GpuFences::PacingOnDecode()) {
+        Gow3GpuFences::AfterSubmit();
+    } else if (result == ORBIS_OK && Gow3DecodePacing::Enabled()) {
+        Gow3DecodePacing::AfterSubmit(true); // the flip waits for the lead, always
+    }
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
@@ -2341,8 +2371,15 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
 
-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    const s32 result =
+        PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+                      const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    if (result == ORBIS_OK && Gow3GpuFences::PacingOnDecode()) {
+        Gow3GpuFences::AfterSubmit();
+    } else if (result == ORBIS_OK && Gow3DecodePacing::Enabled()) {
+        Gow3DecodePacing::AfterSubmit(false);
+    }
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[],
@@ -2356,9 +2393,48 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
+    if (Gow3GpuFences::PacingOnDecode()) {
+        // gow3 GOW3_GPU_FENCES (Bloodborne 0.7, 0fc2921 gpu/platform/gnm/gnm_driver.cpp, the
+        // `decode` lock): no lock to arm. This waits until the GPU has finished the frames before
+        // (as the console's lock would make it wait), then this frame's submissions are counted
+        // from 0: the first GOW3_SUBMIT_AHEAD go straight through (gow3_gpu_fences.cpp). A frame
+        // is one sceGnmSubmitDone to the next: MediEvil calls it once per flip (Deck run 9:
+        // 343 calls in a 5 s window of 68.6 FPS).
+        if (Gow3Stats::enabled) {
+            ++Gow3FenceStats::lock_done_calls;
+        }
+        liverpool->SubmitDone(Gow3GpuFences::BeginFrame());
+        send_init_packet = true;
+        ++frames_submitted;
+        DebugState.IncGnmFrameNum();
+        return ORBIS_OK;
+    }
+    if (Gow3DecodePacing::Enabled()) {
+        // gow3 GOW3_DECODE_PACING (impl-decode-pacing.md): the same `decode` pacing under the copy
+        // model, without arming the lock (which made the next submission wait for GPU idle,
+        // after stage B finished everything). This waits until the game is fewer than
+        // GOW3_DECODE_PACING_LEAD frames ahead of the newest frame stage B and its label writes
+        // retired; then the frame's first GOW3_SUBMIT_AHEAD submissions go straight through, later
+        // ones and the flip wait the same way (gow3_decode_pacing.cpp).
+        if (Gow3Stats::enabled) {
+            ++Gow3FenceStats::lock_done_calls;
+        }
+        liverpool->SubmitDone(Gow3DecodePacing::BeginFrame());
+        send_init_packet = true;
+        ++frames_submitted;
+        DebugState.IncGnmFrameNum();
+        return ORBIS_OK;
+    }
     WaitGpuIdle();
+    if (Gow3Stats::enabled) {
+        ++Gow3FenceStats::lock_done_calls;
+    }
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
+        if (Gow3Stats::enabled) {
+            ++Gow3FenceStats::lock_armed;
+            Gow3FenceStats::lock_armed_at = Gow3FenceStats::NowNs();
+        }
     }
     liverpool->SubmitDone();
     send_init_packet = true;

@@ -59,6 +59,9 @@ StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment,
                                             bool deferred) {
+    (type == MemoryType::HostCached ? Gow3Stats::staging_download_bytes
+                                    : Gow3Stats::staging_upload_bytes)
+        .fetch_add(size, std::memory_order_relaxed);
     Ring& ring = rings[u32(type)];
     if (deferred || size > BLOCK_SIZE) {
         return RequestLarge(size, type, deferred);

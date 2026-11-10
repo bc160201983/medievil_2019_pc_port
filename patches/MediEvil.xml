@@ -48,6 +48,94 @@
             <Line Type="bytes" Address="0x00ce1c85" Value="00020000"/>
         </PatchList>
     </Metadata>
+    <!-- UE4's PS4 display metrics (0xb68fd0, and the work area at 0xb6d640) are computed once and
+         cached: 1920x1080 unless r.PS4Allow4kOutput (int at 0x5b1d1d8, read-only, 0 by default) is
+         set, then 3840x2160 when VideoOut reports a display taller than 1080. Only the game's
+         PS4_Neo_4k device profile sets it. A live r.SetRes to 4K later left these at 1080p, and the
+         menus' gamepad navigation stopped at the old 1080p area. This takes the 4K branch whatever
+         the cvar says; run.py selects it with a 3840x2160 VideoOut (GOW3_UE4_BOOT_4K=1). -->
+    <Metadata Title="MediEvil"
+              Name="4K display metrics at boot"
+              Note="Starts the game at 3840x2160 with a 4K VideoOut (render resolution 4K native). Requires the Native 4K framebuffer pool."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.00"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- je past the 4K query when r.PS4Allow4kOutput == 0 -> nop nop (display metrics) -->
+            <Line Type="bytes" Address="0x00f69032" Value="9090"/>
+            <!-- same in the work area function -->
+            <Line Type="bytes" Address="0x00f6d696" Value="9090"/>
+        </PatchList>
+    </Metadata>
+    <!-- UE4's display metrics and work area start from a default rect {0,0,1920,1080} in rodata
+         (0x3cbe750 and 0x3cbe7b0), each read only by its own function, and are cached once at boot.
+         Writing W and H there boots the game at WxH: window, viewport, backbuffers and UI geometry
+         (research/docs/study-boot-resolution.md). Do not combine with "4K display metrics at boot"
+         while VideoOut reports more than 1080 lines (its 3840x2160 constant wins). -->
+    <Metadata Title="MediEvil"
+              Name="Boot display size"
+              Note="Starts the game at the output resolution (display metrics and work area); no live r.SetRes. run.py selects it as &quot;Boot display size WxH&quot;: each Type=&quot;size&quot; line writes W and H (two little-endian int32). Requires the Native 4K framebuffer pool above 1080p."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.00"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- display metrics default rect (rodata 0x3cbe750): Right, Bottom -->
+            <Line Type="size" Address="0x040be758" Value="1920x1080"/>
+            <!-- work area default rect (rodata 0x3cbe7b0): Right, Bottom -->
+            <Line Type="size" Address="0x040be7b8" Value="1920x1080"/>
+        </PatchList>
+    </Metadata>
+    <!-- UE4's GPU sprite emitters have no particle positions on the CPU: without a fixed bounding
+         box in the asset, UpdateBoundingBox (0x23828b0) gives them a bogus box of origin -1 / +1,
+         so the whole system is culled once its origin leaves the view, even with its particles on
+         screen (the same on a PS4). 8 of the game's 180 GPU particle systems have no fixed box,
+         among them Dan's crypt's floating dust (PS_air_sparkles: a 400-unit sphere and a vector
+         field). The two loads of the -1.0 / 1.0 constants read -2000.0 / 2000.0 from the
+         constant pool instead: a 40 m box; the artists' boxes for similar ambient effects are
+         +/-10000 (research/docs/plan-0102.md, T-0102-5). -->
+    <Metadata Title="MediEvil"
+              Name="GPU particle bounds"
+              Note="Particle effects such as floating dust no longer vanish when the camera turns a little: GPU particle systems without bounds get a 40 m box instead of a 2-unit one."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.00"
+              AppElf="eboot.bin"
+              isEnabled="true">
+        <PatchList>
+            <!-- vmovss xmm2, [rip -> 0x3e245ec (-1.0)] -> [rip -> 0x3d28fc0 (-2000.0)] -->
+            <Line Type="bytes" Address="0x027828e1" Value="db669a01"/>
+            <!-- vmovss xmm6, [rip -> 0x3e245f0 (1.0)] -> [rip -> 0x3d298c0 (2000.0)] -->
+            <Line Type="bytes" Address="0x027828e9" Value="d36f9a01"/>
+        </PatchList>
+    </Metadata>
+    <!-- UE 4.21's BuildHZB (0x1535740) sizes the HZB's mip 0 as 2^(ceil(log2 W) - 1) by
+         2^(ceil(log2 H) - 1) of the view and stretches the whole view over it: 512x256 for a
+         858x482 scene (1280x720 at 67%), 1024x512 at 1280x720. A coarser pyramid hides fewer
+         objects (Deck: ~63 against ~122 a frame). Dropping the two "- 1" gives mip 0 at least the
+         depth's size (1024x512 at 67% of 720p); the occlusion test reads the pyramid's size from
+         the view, so it stays consistent (research/docs/study-ue4-draw-reduction.md section 4).
+         At 4K it would make a 4096x4096 pyramid for nothing: off by default, for low render
+         resolutions. run.py: GOW3_HZB_FULL_SIZE=1 / 0 switches it on / off (extra-env.txt).
+         Original: the bytes each line replaces; patches.py skips the patch if they differ. -->
+    <Metadata Title="MediEvil"
+              Name="Finer occlusion culling (low render resolutions, Steam Deck)"
+              Note="Unreal Engine 4 tests which objects are hidden against a depth pyramid half the size of the 3D scene. This builds it at the scene's full size: more hidden objects are skipped at low render resolutions (about 120-145 fewer draws a frame expected in heavy areas at 67% of 720p). For the Steam Deck and other CPU-limited PCs; not useful at 1080p and above."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.00"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- width: dec r14d -> nop dword [rax] (after vcvttss2si r14d, ceil(log2 W)) -->
+            <Line Type="bytes" Address="0x019357ba" Value="0f1f00" Original="41ffce"/>
+            <!-- height: dec eax -> xchg ax, ax (after vcvttss2si eax, ceil(log2 H)) -->
+            <Line Type="bytes" Address="0x01935812" Value="6690" Original="ffc8"/>
+        </PatchList>
+    </Metadata>
     <!-- Same patch for 01.02. The memory manager moved to 0x8f75b0 (+0x2bb0) and the two free
          paths to 0x8e3b80 and 0x8e4800; the patched instructions, the pool table at 0x3c8b750
          and the surrounding code are identical. -->
@@ -79,6 +167,163 @@
             <Line Type="bytes" Address="0x00ce3ba7" Value="00020000"/>
             <Line Type="bytes" Address="0x00ce4842" Value="1d"/>
             <Line Type="bytes" Address="0x00ce4845" Value="00020000"/>
+        </PatchList>
+    </Metadata>
+    <!-- The two boot patches for 01.02: the same functions +0x2c80 (display metrics 0xb6bc50, work
+         area 0xb702c0), their instructions identical; the default rects at rodata 0x3cc1db0 and
+         0x3cc1e10 (research/docs/plan-0102.md). -->
+    <Metadata Title="MediEvil"
+              Name="4K display metrics at boot"
+              Note="Starts the game at 3840x2160 with a 4K VideoOut (render resolution 4K native). Requires the Native 4K framebuffer pool."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.02"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- je past the 4K query when r.PS4Allow4kOutput == 0 -> nop nop (display metrics) -->
+            <Line Type="bytes" Address="0x00f6bcb2" Value="9090"/>
+            <!-- same in the work area function -->
+            <Line Type="bytes" Address="0x00f70316" Value="9090"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="MediEvil"
+              Name="Boot display size"
+              Note="Starts the game at the output resolution (display metrics and work area); no live r.SetRes. run.py selects it as &quot;Boot display size WxH&quot;: each Type=&quot;size&quot; line writes W and H (two little-endian int32). Requires the Native 4K framebuffer pool above 1080p."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.02"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- display metrics default rect (rodata 0x3cc1db0): Right, Bottom -->
+            <Line Type="size" Address="0x040c1db8" Value="1920x1080"/>
+            <!-- work area default rect (rodata 0x3cc1e10): Right, Bottom -->
+            <Line Type="size" Address="0x040c1e18" Value="1920x1080"/>
+        </PatchList>
+    </Metadata>
+    <!-- GPU particle bounds for 01.02: UpdateBoundingBox at 0x2385680 (+0x2dd0), the same bytes
+         apart from its RIP displacements; the constants at 0x3e276ac / 0x3e276b0 (-1 / 1) and
+         0x3d2c3c0 / 0x3d2ccc0 (-2000 / 2000). -->
+    <Metadata Title="MediEvil"
+              Name="GPU particle bounds"
+              Note="Particle effects such as floating dust no longer vanish when the camera turns a little: GPU particle systems without bounds get a 40 m box instead of a 2-unit one."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.02"
+              AppElf="eboot.bin"
+              isEnabled="true">
+        <PatchList>
+            <!-- vmovss xmm2, [rip -> 0x3e276ac (-1.0)] -> [rip -> 0x3d2c3c0 (-2000.0)] -->
+            <Line Type="bytes" Address="0x027856b1" Value="0b6d9a01"/>
+            <!-- vmovss xmm6, [rip -> 0x3e276b0 (1.0)] -> [rip -> 0x3d2ccc0 (2000.0)] -->
+            <Line Type="bytes" Address="0x027856b9" Value="03769a01"/>
+        </PatchList>
+    </Metadata>
+    <!-- Finer occlusion culling for 01.02: BuildHZB at 0x15383c0 (+0x2c80), the same bytes. -->
+    <Metadata Title="MediEvil"
+              Name="Finer occlusion culling (low render resolutions, Steam Deck)"
+              Note="Unreal Engine 4 tests which objects are hidden against a depth pyramid half the size of the 3D scene. This builds it at the scene's full size: more hidden objects are skipped at low render resolutions (about 120-145 fewer draws a frame expected in heavy areas at 67% of 720p). For the Steam Deck and other CPU-limited PCs; not useful at 1080p and above."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.02"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- width: dec r14d -> nop dword [rax] -->
+            <Line Type="bytes" Address="0x0193843a" Value="0f1f00" Original="41ffce"/>
+            <!-- height: dec eax -> xchg ax, ax -->
+            <Line Type="bytes" Address="0x01938492" Value="6690" Original="ffc8"/>
+        </PatchList>
+    </Metadata>
+    <!-- UE 4.21's ANavigationData::TickActor (01.02 0x2c94b30, 01.00 0x2c91d70; four nav-data
+         vtables) purges ActivePaths every frame: from the end, an entry whose TWeakPtr's shared
+         reference count is 0 is removed. The PS4 build's AtomicRead puts an mfence before and
+         after each count load (mfence; mov eax, [rax+8]; mfence), so the game thread's misses on
+         the scattered reference controllers cannot overlap: the Deck's top main-thread samples
+         (perf: guest+0x2c94ba2/ba5/ba8, ~6% of the thread). An aligned 32-bit load is atomic on
+         x86 and the loop stores nothing the fences would order against; the count never rises
+         from 0 and the weak reference keeps the controller allocated, so the purge decides the
+         same (a path that dies during the read is dropped a frame later, as before). The load
+         stays, the fences become one nop (research/docs/impl-cpu-waste.md). Off by default:
+         run.py GOW3_NAV_PURGE_NOFENCE=1 / 0 switches it on / off (extra-env.txt). -->
+    <Metadata Title="MediEvil"
+              Name="Navigation path purge without fences (CPU)"
+              Note="The game thread checks its navigation paths every frame with a full memory fence around each check. This drops the fences (the check itself is unchanged): less game-thread CPU time, for CPU-limited PCs such as the Steam Deck."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.00"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- mfence; mov eax, [rax+8]; mfence -> mov eax, [rax+8]; nop word [rax+rax] -->
+            <Line Type="bytes" Address="0x03091ddf" Value="8b4008660f1f440000" Original="0faef08b40080faef0"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="MediEvil"
+              Name="Navigation path purge without fences (CPU)"
+              Note="The game thread checks its navigation paths every frame with a full memory fence around each check. This drops the fences (the check itself is unchanged): less game-thread CPU time, for CPU-limited PCs such as the Steam Deck."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.02"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- mfence; mov eax, [rax+8]; mfence -> mov eax, [rax+8]; nop word [rax+rax] -->
+            <Line Type="bytes" Address="0x03094b9f" Value="8b4008660f1f440000" Original="0faef08b40080faef0"/>
+        </PatchList>
+    </Metadata>
+    <!-- The single GPU particle pass (r.GPUParticle.FixDeltaSeconds 0, the in-game menu's
+         "Single GPU particle pass") without losing the fixed step of emitters whose local vector
+         field asks for it (bUseFixDT, flag 8 at Simulation+0x1cc: PS_air_sparkles in Dan's crypt,
+         leaves and fluff). Unpatched, 0 also turns their 1/30 s steps into one step of the frame
+         time; patched, the game thread (FGPUSpriteParticleEmitterInstance's per-frame data,
+         01.00 0x2382e50) always steps with the registered 1/30 s, and the single pass on the
+         render thread (SimulateGPUParticles 0x2366cb0) runs as the fixed-step pass: the
+         emitters' fixed-step parameters, read from and written to the same buffers as before,
+         drawn from the buffer it writes (the cvar's 0 still drops the second, copying pass and
+         reads the current state). Only the sub-step look-ahead of those few emitters is lost
+         (they move in 1/30 s steps). With the cvar at its 1/30 default nothing changes, so the
+         live switch (menu, toggle file second word 8192) still compares with the stock game.
+         research/docs/study-particle-fixed-step.md. Off by default: run.py
+         GOW3_PARTICLE_SINGLE_FIXED=1 / 0 switches it on / off (extra-env.txt). 01.02: the same
+         bytes at +0x2dd0; the 1/30 constant at 0x3e276dc. -->
+    <Metadata Title="MediEvil"
+              Name="GPU particle fixed step in the single pass"
+              Note="With the single GPU particle pass on, particle effects that the artists set to a fixed 1/30 s step (floating sparkles, leaves, fluff) keep it instead of stepping with the frame time. Needs the single pass to change anything."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.00"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- mov rbx, [rip -> 0x5c14d28 (the cvar's value pointer)] -> lea rbx, [rip -> 0x3e2461c (1/30, the registered default)] -->
+            <Line Type="bytes" Address="0x02783a36" Value="488d1ddf0baa01" Original="488b1deb128903"/>
+            <!-- vmovss xmm5, [rbx + rcx*4] (game / render thread slot) -> vmovss xmm5, [rbx]; nop -->
+            <Line Type="bytes" Address="0x02783a5c" Value="c5fa102b90" Original="c5fa102c8b"/>
+            <!-- the first ExecuteSimulationCommands' bUseFixDT (three collision variants): seta al -> mov al, 1; nop -->
+            <Line Type="bytes" Address="0x027684da" Value="b00190" Original="0f97c0"/>
+            <Line Type="bytes" Address="0x0276851f" Value="b00190" Original="0f97c0"/>
+            <Line Type="bytes" Address="0x0276855b" Value="b00190" Original="0f97c0"/>
+        </PatchList>
+    </Metadata>
+    <Metadata Title="MediEvil"
+              Name="GPU particle fixed step in the single pass"
+              Note="With the single GPU particle pass on, particle effects that the artists set to a fixed 1/30 s step (floating sparkles, leaves, fluff) keep it instead of stepping with the frame time. Needs the single pass to change anything."
+              Author="medievil_pc"
+              PatchVer="1.0"
+              AppVer="01.02"
+              AppElf="eboot.bin"
+              isEnabled="false">
+        <PatchList>
+            <!-- mov rbx, [rip -> 0x5c14d68] -> lea rbx, [rip -> 0x3e276dc (1/30)] -->
+            <Line Type="bytes" Address="0x02786806" Value="488d1dcf0eaa01" Original="488b1d5be58803"/>
+            <!-- vmovss xmm5, [rbx + rcx*4] -> vmovss xmm5, [rbx]; nop -->
+            <Line Type="bytes" Address="0x0278682c" Value="c5fa102b90" Original="c5fa102c8b"/>
+            <!-- seta al -> mov al, 1; nop -->
+            <Line Type="bytes" Address="0x0276b2aa" Value="b00190" Original="0f97c0"/>
+            <Line Type="bytes" Address="0x0276b2ef" Value="b00190" Original="0f97c0"/>
+            <Line Type="bytes" Address="0x0276b32b" Value="b00190" Original="0f97c0"/>
         </PatchList>
     </Metadata>
 </Patch>

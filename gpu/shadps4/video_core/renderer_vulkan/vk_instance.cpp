@@ -12,6 +12,7 @@
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/texture_cache/image.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -188,6 +189,7 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
 
 Instance::~Instance() {
     ImGui::Core::Shutdown(GetDevice());
+    VideoCore::DrainImageReleases();
     vmaDestroyAllocator(allocator);
 }
 
@@ -275,7 +277,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR,
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE,
         vk::PhysicalDevicePipelineBinaryFeaturesKHR,
-        vk::PhysicalDeviceMaintenance5FeaturesKHR, vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+        vk::PhysicalDeviceMaintenance5FeaturesKHR, vk::PhysicalDevicePresentIdFeaturesKHR,
+        vk::PhysicalDevicePresentWaitFeaturesKHR, vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
         vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
     features = feature_chain.get().features;
 
@@ -338,6 +341,29 @@ bool Instance::CreateDevice() {
         add_extension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
     maintenance_8 = !VulkanCompat() && !EnvOn("GOW3_NO_MAINTENANCE8") &&
                     add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    // gow3: display times for the flip trace (GOW3_FLIP_TRACE + GOW3_DISPLAY_TRACE=1):
+    // vkWaitForPresentKHR. Off by default: on NVIDIA (T-V120b) the wait returned at the present
+    // itself (0.00 ms later), and with present ids the presents spread like the native run.
+    if (const char* display = std::getenv("GOW3_DISPLAY_TRACE"); display && display[0] == '1') {
+        present_wait = feature_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId &&
+                       feature_chain.get<vk::PhysicalDevicePresentWaitFeaturesKHR>().presentWait &&
+                       add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+                       add_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    }
+    // gow3 GOW3_REFLEX=1: NVIDIA Reflex (VK_NV_low_latency2) paces frames in the driver: the frame
+    // limit becomes its minimum interval. The RTSS limiter in "NVIDIA Reflex" mode held 8.403 +-
+    // 0.002 ms where our own limiters, waiting outside the driver, kept its 0.2-0.6 ms present
+    // time on the frames (T-F16). Present ids mark its frames.
+    if (const char* reflex = std::getenv("GOW3_REFLEX"); reflex && reflex[0] == '1') {
+        const bool ids = present_wait ||
+                         (feature_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId &&
+                          add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME));
+        present_id = ids;
+        low_latency2 = ids && add_extension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+        std::printf("Vulkan: NVIDIA Reflex (VK_NV_low_latency2) %s\n",
+                    low_latency2 ? "enabled" : "not available");
+    }
+    present_id = present_id || present_wait;
     attachment_feedback_loop =
         !VulkanCompat() && add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
@@ -486,6 +512,28 @@ bool Instance::CreateDevice() {
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
     };
+    // gow3 D3 (after the Bloodborne port, 0.3): a queue of a compute family without graphics, to
+    // read back GPU data the GPU finished writing without waiting behind the queued frames
+    // (BufferCache::DownloadMemory). GOW3_READBACK_QUEUE=0 turns it off.
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{queue_info};
+    u32 queue_info_count = 1;
+    if (const char* env = std::getenv("GOW3_READBACK_QUEUE"); !env || env[0] != '0') {
+        const auto families = physical_device.getQueueFamilyProperties();
+        for (std::size_t i = 0; i < families.size(); i++) {
+            const auto flags = families[i].queueFlags;
+            if (!(flags & vk::QueueFlagBits::eGraphics) && (flags & vk::QueueFlagBits::eCompute) &&
+                families[i].queueCount > 0) {
+                readback_family_index = static_cast<u32>(i);
+                queue_infos[1] = vk::DeviceQueueCreateInfo{
+                    .queueFamilyIndex = readback_family_index,
+                    .queueCount = 1,
+                    .pQueuePriorities = queue_priorities.data(),
+                };
+                queue_info_count = 2;
+                break;
+            }
+        }
+    }
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
@@ -504,8 +552,8 @@ bool Instance::CreateDevice() {
     }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = queue_info_count,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -522,6 +570,8 @@ bool Instance::CreateDevice() {
                 .multiDrawIndirect = features.multiDrawIndirect,
                 .depthClamp = features.depthClamp,
                 .depthBiasClamp = features.depthBiasClamp,
+                // gow3: exact sample counts for the game's occlusion queries (vk_occlusion.h).
+                .occlusionQueryPrecise = features.occlusionQueryPrecise,
                 .fillModeNonSolid = features.fillModeNonSolid,
                 .depthBounds = features.depthBounds,
                 .wideLines = features.wideLines,
@@ -664,7 +714,19 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE{
             .shaderMixedFloatDotProductFloat16AccFloat32 = true,
         },
+        vk::PhysicalDevicePresentIdFeaturesKHR{
+            .presentId = true,
+        },
+        vk::PhysicalDevicePresentWaitFeaturesKHR{
+            .presentWait = true,
+        },
     };
+    if (!present_wait) {
+        device_chain.unlink<vk::PhysicalDevicePresentWaitFeaturesKHR>();
+    }
+    if (!present_id) {
+        device_chain.unlink<vk::PhysicalDevicePresentIdFeaturesKHR>();
+    }
 
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
@@ -750,6 +812,10 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (readback_family_index != ~0u) {
+        readback_queue = device->getQueue(readback_family_index, 0);
+        LOG_INFO(Render_Vulkan, "Readback queue: family {}", readback_family_index);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -922,6 +988,11 @@ void Instance::CollectToolingInfo() const {
         driver_id == vk::DriverId::eIntelProprietaryWindows) {
         // AMD: Causes issues with Reshade.
         // Intel: Causes crash on start.
+        return;
+    }
+    // gow3 GOW3_SKIP_TOOL_INFO=1 (run-game.ps1 -Nsys): Nsight Systems 2026.5.1's Vulkan layer forwards
+    // vkGetPhysicalDeviceToolProperties to a null pointer and the game crashes at boot.
+    if (const char* skip = std::getenv("GOW3_SKIP_TOOL_INFO"); skip && skip[0] == '1') {
         return;
     }
     const auto [tools_result, tools] = physical_device.getToolProperties();

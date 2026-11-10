@@ -160,6 +160,9 @@ public:
     bool Start();
     bool Stop();
     void Pause();
+    bool IsPaused() const {
+        return m_is_paused;
+    }
     void Resume();
     bool GetAudioData(AvPlayerFrameInfo& audio_info);
     bool GetVideoData(AvPlayerFrameInfo& video_info);

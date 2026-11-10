@@ -292,4 +292,7 @@ using AvPlayerLogCallback = int PS4_SYSV_ABI (*)(void* p, const char* format, va
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 
+/// gow3: suspends every movie still playing (the game's level change, src/probe.c).
+void SuspendPlayersForLevelChange();
+
 } // namespace Libraries::AvPlayer

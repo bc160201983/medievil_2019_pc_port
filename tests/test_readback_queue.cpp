@@ -1,5 +1,7 @@
+#include <array>
 #include <cstdint>
 #include <cassert>
+#include <utility>
 #include <vector>
 #include "video_core/texture_cache/readback_queue.h"
 
@@ -58,4 +60,31 @@ int main() {
         published_released += entry.valid && !entry.watched;  // still published, no watcher left
     });
     assert(watched == 2 && published_released == 1);
+
+    // C5: the spans cover every page RequiredTick can match, merged into at most N ranges.
+    using Spans = std::array<std::pair<std::uint64_t, std::uint64_t>, 2>;
+    Spans spans{};
+    assert(queue.Spans(spans) == 0);
+    queue.Push(0x10000c00, 4, 11, 8);           // page 0x10000000
+    queue.Push(0x10002000, 8192, 12, 9);        // pages 0x10002000-0x10003fff
+    queue.Push(0x30000010, 16, 13, 10);         // far away
+    queue.Push(0x10005000, 0, 14, 11);          // empty copy on a page boundary
+    assert(queue.Spans(spans) == 2);
+    assert(spans[0].first == 0x10000000 && spans[0].second == 0x10005001);  // closest merged
+    assert(spans[1].first == 0x30000000 && spans[1].second == 0x30001000);
+    for (std::uint64_t address : {0x10000000ull, 0x10000c00ull, 0x10003ff0ull, 0x10004ff8ull,
+                                  0x30000000ull, 0x30000fffull}) {
+        const bool matched = queue.RequiredTick(address, 16) != 0;
+        bool in_span = false;
+        for (const auto& [begin, end] : spans) in_span |= address < end && begin < address + 16;
+        assert(!matched || in_span);
+    }
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 4> wide{};
+    assert(queue.Spans(wide) == 4);
+    assert(wide[0].second == 0x10001000 && wide[1].first == 0x10002000 && wide[1].second == 0x10004000);
+    assert(wide[2].first == 0x10005000 && wide[2].second == 0x10005001);
+    queue.Cancel(0x30000010, 1, [](auto&) {});
+    assert(queue.Spans(wide) == 3);             // canceled copies no longer count
+    queue.Retire([](auto) { return true; }, [](auto&) {});
+    assert(queue.Spans(wide) == 0 && queue.Size() == 0);
 }

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Builds dist/MediEvil-x86_64.AppImage from the Linux build (run build.sh first).
+# Builds dist/MediEvil-x86_64.AppImage from the Linux build (run build.sh first);
+# dist/MediEvil-x86_64-v3.AppImage from a GOW3_CPU_LEVEL=v3 build (its AppRun checks the CPU).
 #
-# What is inside: medievil-runtime and libgow3gpu.so, the libraries a desktop may not have
+# What is inside: medievil-runtime (the GPU library linked in; or libgow3gpu.so beside it from a
+# GOW3_STATIC_GPU=OFF build), the libraries a desktop may not have
 # (SDL3, FFmpeg, xxHash), a standalone Python 3.13 with Tk, Pillow and cryptography for the
 # launcher and the preparation scripts, and the port's scripts and launcher. The host provides
 # glibc, the Vulkan loader and the GPU's Vulkan driver (Mesa, NVIDIA), as for a native game.
@@ -30,7 +32,16 @@ while (( $# )); do
         *) echo "Unknown option $1" >&2; exit 1 ;;
     esac
 done
-[[ -f out/medievil-runtime && -f out/gpu/libgow3gpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+[[ -f out/medievil-runtime ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+# A GOW3_STATIC_GPU=OFF build loads libgow3gpu.so (DT_NEEDED); the default build has it linked in.
+shared_gpu=0
+if objdump -p out/medievil-runtime | grep 'NEEDED *libgow3gpu\.so' >/dev/null; then
+    shared_gpu=1
+    [[ -f out/gpu/libgow3gpu.so ]] || { echo 'out/gpu/libgow3gpu.so missing: bash build.sh' >&2; exit 1; }
+fi
+# The CPU level build.sh built for (GOW3_CPU_LEVEL; out/cpu-level, absent for the default build).
+cpu_level=$(cat out/cpu-level 2>/dev/null || true)
+case $cpu_level in ''|x86-64-v3) ;; *) echo "Unknown CPU level in out/cpu-level: $cpu_level" >&2; exit 1 ;; esac
 if [[ -n ${MEDIEVIL_DEPS:-} ]]; then
     export LD_LIBRARY_PATH=$MEDIEVIL_DEPS/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 fi
@@ -130,7 +141,7 @@ app=out/MediEvil.AppDir
 rm -rf "$app"
 share=$app/usr/share/medievil   # the port tree (PORT_DIR / PORT in the launcher and run.py)
 lib=$app/usr/lib
-mkdir -p "$share/bin/gpu" "$lib/compat" "$app/usr/share/fonts" "$app/usr/share/applications" \
+mkdir -p "$share/bin" "$lib/compat" "$app/usr/share/fonts" "$app/usr/share/applications" \
     "$app/usr/share/icons/hicolor/256x256/apps" "$app/usr/share/metainfo"
 
 # The port: scripts, launcher, patches, docs (no build tree, no Windows packaging).
@@ -139,13 +150,21 @@ cp -r run.py scripts launcher patches LICENSE README.md "$share/"
 mkdir -p "$share/gpu/third_party" && cp -r gpu/third_party/fonts "$share/gpu/third_party/"
 mkdir -p "$share/packaging/linux" && cp packaging/linux/README-Linux.md "$share/packaging/linux/" 2>/dev/null || true
 find "$share" -name '__pycache__' -prune -exec rm -rf {} +
-# Native programs: run.py finds bin/medievil-runtime; its RUNPATH has $ORIGIN/gpu.
+# Native programs: run.py finds bin/medievil-runtime; with a shared GPU library its RUNPATH has
+# $ORIGIN/gpu.
 install -m755 out/medievil-runtime "$share/bin/"
 install -m755 out/medievil-gpu-check "$share/bin/" 2>/dev/null || true
-install -m755 out/gpu/libgow3gpu.so "$share/bin/gpu/"
 patchelf=${PATCHELF:-$(command -v patchelf || echo "${MEDIEVIL_DEPS:-/opt/mdeps}/bin/patchelf")}
-"$patchelf" --set-rpath '$ORIGIN/gpu:$ORIGIN/../../../lib' "$share/bin/medievil-runtime"
-"$patchelf" --set-rpath '$ORIGIN:$ORIGIN/../../../../lib' "$share/bin/gpu/libgow3gpu.so"
+elves=("$share/bin/medievil-runtime")
+if (( shared_gpu )); then
+    mkdir -p "$share/bin/gpu"
+    install -m755 out/gpu/libgow3gpu.so "$share/bin/gpu/"
+    elves+=("$share/bin/gpu/libgow3gpu.so")
+    "$patchelf" --set-rpath '$ORIGIN/gpu:$ORIGIN/../../../lib' "$share/bin/medievil-runtime"
+    "$patchelf" --set-rpath '$ORIGIN:$ORIGIN/../../../../lib' "$share/bin/gpu/libgow3gpu.so"
+else
+    "$patchelf" --set-rpath '$ORIGIN/../../../lib' "$share/bin/medievil-runtime"
+fi
 [[ -f $share/bin/medievil-gpu-check ]] && "$patchelf" --set-rpath '$ORIGIN/../../../lib' "$share/bin/medievil-gpu-check"
 
 # Bundled libraries: everything the programs need that is not part of a normal desktop.
@@ -157,7 +176,12 @@ host_lib() {
         libX11.so*|libX11-xcb.so*|libxcb*.so*|libXau.so*|libXdmcp.so*|libXext.so*|libz.so*) return 0 ;;
         libbsd.so*|libmd.so*) return 0 ;;   # X11's own dependencies
         libgow3gpu.so) return 0 ;;          # installed beside the runtime (bin/gpu)
-        libGL*|libEGL*|libdrm*|libnvidia*|libvulkan*) return 0 ;;  # GPU stack: the host's (one Vulkan loader)
+        libGL*|libEGL*|libdrm*|libnvidia*|libvulkan*|libgbm*) return 0 ;;  # GPU stack: the host's (one Vulkan loader)
+        # The host's Mesa Vulkan drivers link the host's libwayland-client and need its newer
+        # symbols (wl_display_dispatch_queue_timeout); a bundled older copy loaded first by SDL3
+        # made every driver fail to load on SteamOS ("doesn't implement VK_KHR_surface").
+        # From spacepepperoni/medievil_ps4_Linux 22d6f92.
+        libwayland-*.so*) return 0 ;;
     esac
     return 1
 }
@@ -175,7 +199,7 @@ collect() {
     done < <(ldd "$elf" | grep '=>')
 }
 echo 'Libraries:'
-for elf in "$share/bin/medievil-runtime" "$share/bin/gpu/libgow3gpu.so"; do collect "$elf"; done
+for elf in "${elves[@]}"; do collect "$elf"; done
 # The Vulkan loader is the host's: a second, bundled loader next to it crashed (interposed symbols).
 for compat in libstdc++.so.6 libgcc_s.so.1; do
     path=$("${CXX:-g++}" -print-file-name="$compat")
@@ -189,9 +213,11 @@ newest() { # PREFIX FILE...: the newest symbol version PREFIX_x.y the files impo
         [[ -f $f ]] && file -b "$f" | grep -q ELF && objdump -T "$f" 2>/dev/null || true
     done | grep -o "${prefix}_[0-9.]*" | sort -V | tail -1 || true
 }
-native=("$share/bin/medievil-runtime" "$share/bin/gpu/libgow3gpu.so" "$lib"/*.so*)
+native=("${elves[@]}" "$lib"/*.so*)
 need=$(newest GLIBCXX "${native[@]}")
 echo "${need:-GLIBCXX_3.4}" > "$lib/compat/needs"
+# AppRun refuses to start a GOW3_CPU_LEVEL=v3 build on a CPU without AVX2 / BMI2 / FMA.
+[[ -n $cpu_level ]] && echo "$cpu_level" > "$lib/compat/cpu-level"
 
 # Python (launcher, run.py and the preparation scripts).
 cp -a "$py" "$app/usr/python"
@@ -244,7 +270,7 @@ cat > "$app/usr/share/metainfo/medievil-pc.appdata.xml" <<'EOF'
 EOF
 
 mkdir -p dist
-out=dist/MediEvil-x86_64.AppImage
+out=dist/MediEvil-x86_64${cpu_level:+-${cpu_level#x86-64-}}.AppImage
 rm -f "$out"
 # No FUSE needed to build: the tool runs from its extracted copy.
 ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$tool" --no-appstream --runtime-file "$runtime" "$app" "$out" >out/appimagetool.log 2>&1 \
