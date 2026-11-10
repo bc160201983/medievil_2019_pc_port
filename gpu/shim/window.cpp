@@ -157,8 +157,7 @@ void WindowSDL::UpdateTextTitle() {
 // (PR #64). The pointer itself follows UpdateCursor() below.
 static void LogGamepadAdded(const SDL_Event& event) {
     if (event.type == SDL_EVENT_GAMEPAD_ADDED) {
-        std::printf("Window: SDL gamepad added (id %u)
-", static_cast<unsigned>(event.gdevice.which));
+        std::printf("Window: SDL gamepad added (id %u)\n", static_cast<unsigned>(event.gdevice.which));
     }
 }
 
