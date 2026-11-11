@@ -2536,6 +2536,15 @@ def play_without_window(settings):
         return process.wait()
 
 
+def game_argument(args):
+    """--game <path>: the game folder or .pkg for this start only (a front end such as RecompLauncher
+    passes it). Empty without the option; the saved game folder is not changed."""
+    if '--game' not in args:
+        return ''
+    position = args.index('--game') + 1
+    return args[position] if position < len(args) else ''
+
+
 def shortcut_script(folder, target, arguments, icon):
     """PowerShell that saves MediEvil.lnk in a special folder ('Desktop', 'Programs' = Start menu)."""
     return ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut('
@@ -2600,7 +2609,11 @@ def main():
     if FROZEN and UPDATE_DIR not in PORT_DIR.parents:
         shutil.rmtree(UPDATE_DIR, ignore_errors=True)  # what a finished update left behind
     # Without a usable game folder there is nothing to play yet: open the launcher instead.
-    if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():
+    # --game names the copy itself: run.py checks it and says what is wrong with it.
+    game = game_argument(args) if '--play' in args else ''
+    if game:
+        settings['game_dir'] = game
+    if '--play' in args and (game or (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file()):
         sys.exit(play_without_window(settings))
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # sharp text on scaled displays

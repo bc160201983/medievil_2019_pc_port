@@ -1,5 +1,7 @@
 # MediEvil (PS4) for PC
 
+<a href="https://recomplauncher.com/game/medievil-2019-pc-port"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 A PC port of **MediEvil** (PlayStation 4, 2019, CUSA11227; the European CUSA12982 works too) for
 Windows 10 and 11 and the Steam Deck (Linux), built on the
 [God of War III PC port](https://github.com/FelipePrado0/gow3_pc).
