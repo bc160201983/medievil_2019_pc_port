@@ -1,0 +1,160 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "MediEvil (PS4) for PC",
+  "repo": "bc160201983/medievil_2019_pc_port",
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your copy of MediEvil (PS4, 2019): the unpacked game folder with eboot.bin (CUSA11227, or the European CUSA12982), or its fake package (.pkg).",
+      "role": "game",
+      "formats": [
+        { "type": "folder" },
+        { "type": "file", "extensions": ["pkg"] }
+      ]
+    },
+    {
+      "id": "dlss",
+      "label": "NVIDIA DLSS",
+      "role": "runtime",
+      "shared": "nvidia.dlss",
+      "optional": true,
+      "destination": "bin/nvngx_dlss.dll"
+    }
+  ],
+  "start": {
+    "program": ["MediEvil.exe", "MediEvil-x86_64.AppImage", "MediEvil-x86_64-v3.AppImage"],
+    "args": ["--play", "--game", "{input:game}"]
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        { "path": "{local}/medievil-pc/medievil.ini", "if": "{local}/medievil-pc" },
+        { "path": "{install}/medievil.ini" }
+      ]
+    }
+  ],
+  "folders": {
+    "saves": [
+      { "path": "{local}/medievil-pc/user/savedata", "if": "{local}/medievil-pc" },
+      { "path": "{install}/user/savedata" }
+    ],
+    "logs": [
+      { "path": "{local}/medievil-pc/user", "if": "{local}/medievil-pc" },
+      { "path": "{install}/user" }
+    ]
+  },
+  "saves": ["{local}/medievil-pc/user/savedata", "{install}/user/savedata"],
+  "settings": [
+    {
+      "id": "window",
+      "label": "Window",
+      "help": "Windowed, borderless (fills the screen, quick to switch apps) or fullscreen.",
+      "choices": [
+        { "label": "Windowed", "set": { "display_mode": "windowed" } },
+        { "label": "Borderless", "set": { "display_mode": "borderless" } },
+        { "label": "Fullscreen", "set": { "display_mode": "fullscreen" } }
+      ],
+      "defaults": { "display_mode": "windowed" }
+    },
+    {
+      "id": "output",
+      "label": "Output resolution",
+      "help": "The size of the game's picture. Pick your screen's size for a sharp picture.",
+      "choices": [
+        { "label": "720p", "set": { "output_resolution": "1280x720" } },
+        { "label": "1080p", "set": { "output_resolution": "1920x1080" } },
+        { "label": "1440p", "set": { "output_resolution": "2560x1440" } },
+        { "label": "1800p", "set": { "output_resolution": "3200x1800" } },
+        { "label": "4K", "set": { "output_resolution": "3840x2160" } },
+        { "label": "Your screen", "set": { "output_resolution": "display" } }
+      ],
+      "defaults": { "output_resolution": "1920x1080" }
+    },
+    {
+      "id": "render_scale",
+      "label": "Render scale",
+      "help": "How sharp the 3D scene is, compared to the output. Above 100% is sharper but slower, below 100% is faster.",
+      "choices": [
+        { "label": "50%", "set": { "render_scale": "50" } },
+        { "label": "67%", "set": { "render_scale": "67" } },
+        { "label": "100%", "set": { "render_scale": "100" } },
+        { "label": "133%", "set": { "render_scale": "133" } },
+        { "label": "167%", "set": { "render_scale": "167" } },
+        { "label": "200%", "set": { "render_scale": "200" } }
+      ],
+      "defaults": { "render_scale": "100" }
+    },
+    {
+      "id": "quality",
+      "label": "Graphics quality",
+      "help": "Console is the PS4's own look. Low suits integrated graphics; High and Ultra add shadow and reflection detail.",
+      "choices": [
+        { "label": "Low", "set": { "ue4_quality": "low" } },
+        { "label": "Medium", "set": { "ue4_quality": "medium" } },
+        { "label": "Console", "set": { "ue4_quality": "console" } },
+        { "label": "High", "set": { "ue4_quality": "high" } },
+        { "label": "Ultra", "set": { "ue4_quality": "ultra" } }
+      ],
+      "defaults": { "ue4_quality": "console" }
+    },
+    {
+      "id": "anti_aliasing",
+      "label": "Anti-aliasing",
+      "help": "Temporal is the game's own and smooth. FXAA is sharper. Below 100% render scale it stays temporal.",
+      "choices": [
+        { "label": "Temporal", "set": { "ue4_aa": "taa" } },
+        { "label": "FXAA", "set": { "ue4_aa": "fxaa" } },
+        { "label": "Off", "set": { "ue4_aa": "off" } }
+      ],
+      "defaults": { "ue4_aa": "taa" }
+    },
+    {
+      "id": "frame_rate",
+      "label": "Frame rate",
+      "help": "60 is the PS4's own and the safe choice. 120 and 240 are experimental: they can stutter and need a fast CPU.",
+      "choices": [
+        { "label": "60", "set": { "engine_fps": "60" } },
+        { "label": "120", "set": { "engine_fps": "120" } },
+        { "label": "240", "set": { "engine_fps": "240" } }
+      ],
+      "defaults": { "engine_fps": "60" }
+    },
+    {
+      "id": "vsync",
+      "label": "VSync",
+      "help": "Waits for the screen's refresh. Off can tear but lowers the delay.",
+      "choices": [
+        { "label": "On", "set": { "vsync": "1" } },
+        { "label": "Off", "set": { "vsync": "0" } }
+      ],
+      "defaults": { "vsync": "1" }
+    },
+    {
+      "id": "dlss",
+      "label": "NVIDIA DLSS",
+      "help": "NVIDIA RTX cards only. DLAA at 100% render scale, DLSS upscaling below it.",
+      "choices": [
+        { "label": "Off", "set": { "ue4_dlss": "0" } },
+        { "label": "On", "set": { "ue4_dlss": "1" } }
+      ],
+      "defaults": { "ue4_dlss": "0" }
+    },
+    {
+      "id": "fps_counter",
+      "label": "Show FPS",
+      "help": "The frame rate in a corner of the game.",
+      "choices": [
+        { "label": "Off", "set": { "show_fps": "0" } },
+        { "label": "On", "set": { "show_fps": "1" } }
+      ],
+      "defaults": { "show_fps": "1" }
+    }
+  ],
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "Your saves. They are backed up before every start.", "open": "saves" },
+    { "id": "logs", "label": "Log", "help": "last_run.log: send it with a bug report.", "open": "logs" }
+  ]
+}

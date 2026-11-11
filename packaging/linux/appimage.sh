@@ -240,6 +240,8 @@ cp gpu/third_party/fonts/*.ttf gpu/third_party/fonts/LICENSE-DejaVu.txt "$app/us
 
 # Desktop integration.
 install -m755 packaging/linux/AppRun "$app/AppRun"
+# RecompLauncher reads this file from the AppImage's top folder.
+cp recomplauncher.json "$app/recomplauncher.json"
 cp launcher/medievil.png "$app/usr/share/icons/hicolor/256x256/apps/medievil-pc.png"
 cp launcher/medievil.png "$app/medievil-pc.png"
 cat > "$app/usr/share/applications/medievil-pc.desktop" <<'EOF'
